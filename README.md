@@ -5,7 +5,7 @@ OpenGL 3.3 renderer. No Electron, no wgpu, no Vulkan.
 
 ## What it is
 
-- ~2.5k lines of Rust across 16 source files
+- ~1.5k lines of Rust across 16 source files
 - `winit` + `glutin` + `glow` for a GL 3.3 core window
 - `ropey` for the text buffer, `fontdue` for glyph rasterisation
 - One static unit quad drawn instanced: a rect batch and a glyph batch, so a
@@ -32,7 +32,7 @@ cargo run --release -- main.cpp
 | Key | Action |
 | --- | --- |
 | Arrows / Home / End / PgUp / PgDn | Move |
-| Ctrl+Left / Ctrl+Right | Word left / right |
+| Mouse wheel | Scroll |
 | Enter, Backspace, Delete, Tab | Edit |
 | Ctrl+S | Save |
 | Ctrl+Q | Quit |
