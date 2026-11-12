@@ -35,6 +35,15 @@ pub fn draw(r: &mut Renderer, ed: &Editor, l: &Layout) {
     let last = (first + l.rows).min(ed.buffer.line_count());
     let mut digits_buf = [0u8; 20];
 
+    // Clip to the text area so a long line can never paint over the gutter or
+    // the status bar. The clip is in points; the renderer scales it.
+    r.push_clip(
+        l.text_x,
+        l.text_y,
+        l.text_w,
+        l.height - l.status_h - l.text_y,
+    );
+
     for idx in first..last {
         let y = l.text_y + (idx - first) as f32 * l.cell_h;
 
@@ -44,7 +53,10 @@ pub fn draw(r: &mut Renderer, ed: &Editor, l: &Layout) {
         r.text(nx, y, num, theme::GUTTER_TEXT);
 
         let line = ed.buffer.line(idx);
-        r.text(l.text_x, y, &line, theme::TEXT);
+        // Only the visible columns are laid out: a 100,000-character line
+        // costs the same as a short one.
+        let visible = visible_slice(&line, ed.scroll_x, l.cols);
+        r.text(l.text_x, y, visible, theme::TEXT);
     }
 
     // Cursor: a thin vertical bar at the character cell under the cursor.
@@ -52,9 +64,15 @@ pub fn draw(r: &mut Renderer, ed: &Editor, l: &Layout) {
     // lines up with the glyphs (see issue #1: fractional advance drift).
     if ed.cursor.line >= first && ed.cursor.line < last {
         let y = l.text_y + (ed.cursor.line - first) as f32 * l.cell_h;
-        let x = r.text_pen_x(l.text_x, ed.cursor.col);
+        let line = ed.buffer.line(ed.cursor.line);
+        // Both positions are measured on the full line, so tab stops stay
+        // correct; the difference is where the caret sits in the scrolled view.
+        let x = r.text_pen_x(l.text_x, &line, ed.cursor.col)
+            - (r.text_pen_x(l.text_x, &line, ed.scroll_x) - l.text_x);
         r.rect(x, y, CURSOR_W, l.cell_h, theme::CURSOR);
     }
+
+    r.pop_clip();
 
     // Status bar: filename on the left, position on the right.
     let sy = l.height - l.status_h;
@@ -82,6 +100,26 @@ pub fn draw(r: &mut Renderer, ed: &Editor, l: &Layout) {
     let pos = format!("Ln {}, Col {}", ed.cursor.line + 1, ed.cursor.col + 1);
     let px = (l.width - GUTTER_PAD - pos.len() as f32 * l.cell_w).max(0.0);
     r.text(px, text_y, &pos, theme::STATUS_TEXT);
+}
+
+/// The part of `line` that is visible when scrolled `scroll_x` columns right.
+/// Returns a slice of the original string, so no allocation per line.
+fn visible_slice(line: &str, scroll_x: usize, cols: usize) -> &str {
+    if scroll_x == 0 {
+        // Fast path: take at most `cols` characters.
+        return match line.char_indices().nth(cols) {
+            Some((i, _)) => &line[..i],
+            None => line,
+        };
+    }
+    let mut it = line.char_indices().skip(scroll_x);
+    let Some((start, _)) = it.next() else {
+        return "";
+    };
+    match it.nth(cols.saturating_sub(1)) {
+        Some((end, _)) => &line[start..end],
+        None => &line[start..],
+    }
 }
 
 /// Small stack-formatted line number, avoiding an allocation per visible line.

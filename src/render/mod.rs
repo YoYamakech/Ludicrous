@@ -27,6 +27,11 @@ const TEXT_FRAG: &str = include_str!("shaders/text.frag");
 const MAX_RECTS: usize = 8192;
 const MAX_GLYPHS: usize = 32768;
 
+/// A tab advances to the next multiple of this many columns. The editor also
+/// inserts spaces for Tab (item 7), so this only matters for tabs already in a
+/// file.
+pub const TAB_COLUMNS: usize = 4;
+
 /// Paint order. Switching forces a flush, so `Background` always lands under
 /// `Content`, and `Overlay` (tooltips, menus) lands on top of everything.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -333,17 +338,30 @@ impl Renderer {
         );
     }
 
-    /// X of the pen for character `col` of a line starting at `x`, in points.
+    /// X of the pen for character `col` of `line` starting at `x`, in points.
     ///
     /// This repeats exactly what `queue_text` does (round the base, then add
     /// the unrounded advance, then round again), so a caret drawn here lands
     /// on the same pixel column as the glyph it sits in front of. Using
     /// `x + col * cell_w` directly drifts by a pixel or two because the
-    /// advance is fractional (9.03 px for the bundled font).
-    pub fn text_pen_x(&self, x: f32, col: usize) -> f32 {
+    /// advance is fractional (9.03 px for the bundled font). Tabs are walked
+    /// too, so the caret stays right on lines that contain them.
+    pub fn text_pen_x(&self, x: f32, line: &str, col: usize) -> f32 {
         let s = self.scale;
-        let base = (x * s).round();
-        ((base + col as f32 * self.atlas.cell_w).round()) / s
+        let cell_w = self.atlas.cell_w;
+        let mut pen = (x * s).round();
+        let mut c = 0usize;
+        for ch in line.chars().take(col) {
+            if ch == '\t' {
+                let next = (c / TAB_COLUMNS + 1) * TAB_COLUMNS;
+                pen += (next - c) as f32 * cell_w;
+                c = next;
+            } else {
+                pen += cell_w;
+                c += 1;
+            }
+        }
+        pen.round() / s
     }
 
     /// Width of `s` in points at the editor size.
@@ -438,8 +456,19 @@ fn queue_text(
     let cell_w = atlas.cell_w;
     let baseline = (y * scale + atlas.ascent).round();
     let mut pen = (x * scale).round();
+    let mut col = 0usize;
     for ch in s.chars() {
-        if let Some(g) = atlas.get(ch) {
+        // A tab advances to the next tab stop instead of drawing a glyph.
+        if ch == '\t' {
+            let next = (col / TAB_COLUMNS + 1) * TAB_COLUMNS;
+            pen += (next - col) as f32 * cell_w;
+            col = next;
+            continue;
+        }
+        // Unknown characters (anything outside ASCII) draw as `?` rather than
+        // vanishing, and never panic.
+        let g = atlas.get(ch).or_else(|| atlas.fallback());
+        if let Some(g) = g {
             let gx = (pen + g.xoff).round();
             let gy = (baseline - g.yoff).round();
             batch.push(&[
@@ -448,5 +477,6 @@ fn queue_text(
             ]);
         }
         pen += cell_w;
+        col += 1;
     }
 }

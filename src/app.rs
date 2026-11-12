@@ -160,7 +160,7 @@ impl App {
         // Layout works in points; the renderer scales internally.
         let (w, h) = (size.width as f32 / scale, size.height as f32 / scale);
         let layout = Layout::new(r, ed.buffer.line_count(), w, h);
-        ed.ensure_visible(layout.rows);
+        ed.ensure_visible(layout.rows, layout.cols);
         view::draw(r, ed, &layout);
 
         r.flush();

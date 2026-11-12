@@ -7,10 +7,21 @@ use std::path::{Path, PathBuf};
 
 use ropey::Rope;
 
+/// How the file used newlines when we opened it. The rope always stores plain
+/// `\n`, so the editor only ever deals with one line ending; this is applied
+/// again on save so we do not rewrite a Windows file as a Unix one.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum LineEnding {
+    Lf,
+    CrLf,
+}
+
+#[derive(Debug)]
 pub struct Buffer {
     pub rope: Rope,
     pub path: Option<PathBuf>,
     pub modified: bool,
+    pub line_ending: LineEnding,
 }
 
 impl Buffer {
@@ -19,15 +30,38 @@ impl Buffer {
             rope: Rope::new(),
             path: None,
             modified: false,
+            line_ending: LineEnding::Lf,
         }
     }
 
     pub fn open(path: &Path) -> io::Result<Self> {
-        let text = std::fs::read_to_string(path)?;
+        let bytes = std::fs::read(path)?;
+        // Refuse anything that is not UTF-8 instead of mangling it: a lossy
+        // conversion would silently corrupt the file on the next save.
+        let text = String::from_utf8(bytes).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "file is not valid UTF-8 (refusing to open it)",
+            )
+        })?;
+        // Detect the dominant line ending, then normalise to `\n` in the rope.
+        let crlf = text.matches("\r\n").count();
+        let lf = text.matches('\n').count();
+        let line_ending = if crlf > 0 && crlf * 2 >= lf {
+            LineEnding::CrLf
+        } else {
+            LineEnding::Lf
+        };
+        let text = if line_ending == LineEnding::CrLf {
+            text.replace("\r\n", "\n")
+        } else {
+            text
+        };
         Ok(Self {
             rope: Rope::from_str(&text),
             path: Some(path.to_path_buf()),
             modified: false,
+            line_ending,
         })
     }
 
@@ -151,7 +185,13 @@ impl Buffer {
 
         let result = (|| -> io::Result<()> {
             let mut file = std::fs::File::create(&tmp)?;
-            file.write_all(self.rope.to_string().as_bytes())?;
+            // The rope is always LF; put the original style back on disk.
+            let text = self.rope.to_string();
+            let out = match self.line_ending {
+                LineEnding::Lf => text,
+                LineEnding::CrLf => text.replace('\n', "\r\n"),
+            };
+            file.write_all(out.as_bytes())?;
             // sync_all pushes the bytes to the device before the rename, so a
             // power loss cannot leave the new name pointing at empty data.
             file.sync_all()?;
@@ -182,6 +222,7 @@ mod tests {
             rope: Rope::from_str(text),
             path: None,
             modified: false,
+            line_ending: LineEnding::Lf,
         }
     }
 
@@ -248,6 +289,60 @@ mod tests {
     }
 
     #[test]
+    fn multibyte_chars_are_indexed_by_char() {
+        let mut b = buf("aé日");
+        assert_eq!(b.line_len(0), 3);
+        // Insert between the multi-byte characters: a byte index would split
+        // them and panic inside ropey.
+        b.insert_char(0, 2, 'x');
+        assert_eq!(b.line(0), "aéx日");
+        b.insert_char(0, 1, 'z');
+        assert_eq!(b.line(0), "azéx日");
+    }
+
+    #[test]
+    fn deleting_multibyte_chars_keeps_the_rest_intact() {
+        let mut b = buf("é日🙂");
+        assert_eq!(b.line_len(0), 3);
+        b.delete(0, 1);
+        assert_eq!(b.line(0), "é🙂");
+        b.delete(0, 1);
+        assert_eq!(b.line(0), "é");
+        assert_eq!(b.backspace(0, 1), (0, 0));
+        assert_eq!(b.line(0), "");
+    }
+
+    #[test]
+    fn crlf_files_round_trip() {
+        let dir = std::env::temp_dir().join("ludicrous-test-crlf");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("win.txt");
+        std::fs::write(&path, "one\r\ntwo\r\n").unwrap();
+        let mut b = Buffer::open(&path).unwrap();
+        assert_eq!(b.line_ending, LineEnding::CrLf);
+        // The rope is normalised, so the editor never sees a stray `\r`.
+        assert_eq!(b.line(0), "one");
+        assert_eq!(b.line_len(0), 3);
+        b.insert_char(0, 3, '!');
+        b.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one!\r\ntwo\r\n");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn invalid_utf8_is_refused() {
+        let dir = std::env::temp_dir().join("ludicrous-test-badutf8");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("latin1.txt");
+        std::fs::write(&path, [0x63, 0x61, 0x66, 0xe9]).unwrap(); // "café" in Latin-1
+        let err = Buffer::open(&path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        // The file on disk is untouched.
+        assert_eq!(std::fs::read(&path).unwrap(), vec![0x63, 0x61, 0x66, 0xe9]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn save_clears_modified() {
         let dir = std::env::temp_dir().join("ludicrous-test-save");
         std::fs::create_dir_all(&dir).unwrap();
@@ -284,6 +379,7 @@ mod tests {
             rope: Rope::from_str("new"),
             path: Some(path.clone()),
             modified: true,
+            line_ending: LineEnding::Lf,
         };
         assert!(b.save().is_err());
         assert!(b.modified);

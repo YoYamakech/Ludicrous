@@ -26,8 +26,13 @@ pub struct Editor {
     pub cursor: Cursor,
     /// First visible line (0 = top of file).
     pub scroll: usize,
+    /// First visible column (0 = left edge of the text area). Long lines are
+    /// scrolled horizontally instead of being clipped at the right edge.
+    pub scroll_x: usize,
     /// How many lines fit in the text area; set by the UI before drawing.
     pub rows: usize,
+    /// How many columns fit in the text area; set by the UI before drawing.
+    pub cols: usize,
     /// Short message for the status bar (e.g. a failed save). Cleared as soon
     /// as the next command runs, so it never sticks around forever.
     pub status: Option<String>,
@@ -45,7 +50,9 @@ impl Editor {
             buffer,
             cursor: Cursor::new(),
             scroll: 0,
+            scroll_x: 0,
             rows: 1,
+            cols: 80,
             status: None,
             quit_armed: None,
             history: History::new(),
@@ -309,13 +316,22 @@ impl Editor {
     }
 
     /// Scroll as little as possible so the cursor stays on screen.
-    /// Called by the app once it knows how many lines fit.
-    pub fn ensure_visible(&mut self, rows: usize) {
+    /// Called by the app once it knows how many lines and columns fit.
+    pub fn ensure_visible(&mut self, rows: usize, cols: usize) {
         self.rows = rows.max(1);
+        self.cols = cols.max(1);
         if self.cursor.line < self.scroll {
             self.scroll = self.cursor.line;
         } else if self.cursor.line >= self.scroll + self.rows {
             self.scroll = self.cursor.line + 1 - self.rows;
+        }
+        // Horizontal: keep one column of context on the right so the caret is
+        // never glued to the edge.
+        let visible = self.cols.saturating_sub(1).max(1);
+        if self.cursor.col < self.scroll_x {
+            self.scroll_x = self.cursor.col;
+        } else if self.cursor.col >= self.scroll_x + visible {
+            self.scroll_x = self.cursor.col + 1 - visible;
         }
     }
 }
@@ -330,6 +346,7 @@ mod tests {
             rope: Rope::from_str(text),
             path: None,
             modified: false,
+            line_ending: crate::editor::buffer::LineEnding::Lf,
         })
     }
 
@@ -408,7 +425,7 @@ mod tests {
         for _ in 0..10 {
             ed.apply(Command::Down);
         }
-        ed.ensure_visible(5);
+        ed.ensure_visible(5, 80);
         assert!(ed.cursor.line >= ed.scroll);
         assert!(ed.cursor.line < ed.scroll + 5);
     }
@@ -529,6 +546,21 @@ mod tests {
         ed.apply(Command::Undo);
         assert_eq!(ed.buffer.line(0), "abc");
         assert!(!ed.is_dirty());
+    }
+
+    #[test]
+    fn horizontal_scroll_follows_the_cursor() {
+        let mut ed = editor(&"x".repeat(200));
+        ed.ensure_visible(10, 20);
+        assert_eq!(ed.scroll_x, 0);
+        ed.apply(Command::End);
+        ed.ensure_visible(10, 20);
+        // The caret must be inside the visible window, with one column spare.
+        assert!(ed.cursor.col >= ed.scroll_x);
+        assert!(ed.cursor.col < ed.scroll_x + 20);
+        ed.apply(Command::Home);
+        ed.ensure_visible(10, 20);
+        assert_eq!(ed.scroll_x, 0);
     }
 
     #[test]

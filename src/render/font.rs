@@ -37,6 +37,13 @@ impl Atlas {
             None
         }
     }
+
+    /// Glyph to draw for a character the atlas does not have (non-ASCII).
+    /// A `?` is better than a blank cell: the user can see that something is
+    /// there, and nothing panics on an unknown character.
+    pub fn fallback(&self) -> Option<&Glyph> {
+        self.get('?')
+    }
 }
 
 /// Build the atlas for ASCII 32..=126 at `px` pixels.

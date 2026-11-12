@@ -11,9 +11,14 @@ pub struct Layout {
     pub gutter_w: f32,
     pub text_x: f32,
     pub text_y: f32,
+    /// Width of the text area in points (right edge of the window minus the
+    /// gutter and padding). Used for clipping and horizontal scrolling.
+    pub text_w: f32,
     pub status_h: f32,
     /// Number of full text lines that fit between the top and the status bar.
     pub rows: usize,
+    /// Number of character cells that fit across the text area.
+    pub cols: usize,
 }
 
 const PAD_X: f32 = 8.0; // padding inside the gutter and the text area
@@ -29,6 +34,9 @@ impl Layout {
         let text_y = PAD_Y;
         let usable = (height - status_h - text_y).max(cell_h);
         let rows = (usable / cell_h).floor().max(1.0) as usize;
+        let text_x = gutter_w + PAD_X;
+        let text_w = (width - text_x - PAD_X).max(cell_w);
+        let cols = (text_w / cell_w).floor().max(1.0) as usize;
 
         Self {
             width,
@@ -36,10 +44,12 @@ impl Layout {
             cell_w,
             cell_h,
             gutter_w,
-            text_x: gutter_w + PAD_X,
+            text_x,
             text_y,
+            text_w,
             status_h,
             rows,
+            cols,
         }
     }
 }
