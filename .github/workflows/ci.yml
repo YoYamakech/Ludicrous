@@ -14,7 +14,7 @@ jobs:
     name: fmt, clippy, build, test
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Build-time deps for winit/glutin. No display is needed: CI never opens
       # a window, it only compiles and runs the headless unit tests.
@@ -51,7 +51,7 @@ jobs:
     name: release build
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install system libraries
         run: |
@@ -73,7 +73,7 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: ludicrous-linux-x86_64
           path: target/release/ludicrous
