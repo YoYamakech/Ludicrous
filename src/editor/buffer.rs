@@ -2,7 +2,7 @@
 // ropey stores the text as a tree of chunks, so inserting a character in a
 // large file does not copy the whole string.
 
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use ropey::Rope;
@@ -104,11 +104,43 @@ impl Buffer {
         (line, col)
     }
 
+    /// Write the text back to disk without ever truncating the original file.
+    ///
+    /// We write a sibling temp file, flush it to the disk, then rename it over
+    /// the original. A crash or a full disk therefore leaves either the old
+    /// file or the new one, never a half-written file. `modified` is only
+    /// cleared once the rename succeeded.
     pub fn save(&mut self) -> io::Result<()> {
-        let Some(path) = &self.path else {
-            return Ok(());
+        let Some(path) = self.path.clone() else {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "No file name"));
         };
-        std::fs::write(path, self.rope.to_string())?;
+
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("buffer");
+        let tmp = dir.join(format!(".{name}.ludicrous-tmp"));
+
+        let result = (|| -> io::Result<()> {
+            let mut file = std::fs::File::create(&tmp)?;
+            file.write_all(self.rope.to_string().as_bytes())?;
+            // sync_all pushes the bytes to the device before the rename, so a
+            // power loss cannot leave the new name pointing at empty data.
+            file.sync_all()?;
+            drop(file);
+            // Keep the original permissions (File::create would use 0644).
+            if let Ok(meta) = std::fs::metadata(&path) {
+                let _ = std::fs::set_permissions(&tmp, meta.permissions());
+            }
+            std::fs::rename(&tmp, &path)
+        })();
+
+        if result.is_err() {
+            // Best effort: do not leave temp files behind on failure.
+            let _ = std::fs::remove_file(&tmp);
+            return result;
+        }
         self.modified = false;
         Ok(())
     }
@@ -200,6 +232,58 @@ mod tests {
         b.save().unwrap();
         assert!(!b.modified);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), ">hi");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_without_path_is_an_error() {
+        let mut b = buf("text");
+        b.modified = true;
+        let err = b.save().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        // Nothing was written, so the buffer is still dirty.
+        assert!(b.modified);
+    }
+
+    #[test]
+    fn failed_save_leaves_original_and_no_temp_file() {
+        let dir = std::env::temp_dir().join("ludicrous-test-save-fail");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A directory in place of the target file makes the final rename fail.
+        let path = dir.join("target");
+        std::fs::create_dir(&path).unwrap();
+        let mut b = Buffer {
+            rope: Rope::from_str("new"),
+            path: Some(path.clone()),
+            modified: true,
+        };
+        assert!(b.save().is_err());
+        assert!(b.modified);
+        assert!(path.is_dir(), "original entry must be untouched");
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers, vec![std::ffi::OsString::from("target")]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_keeps_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join("ludicrous-test-save-perms");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("secret.txt");
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut b = Buffer::open(&path).unwrap();
+        b.insert_char(0, 0, 'x');
+        b.save().unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
         let _ = std::fs::remove_file(&path);
     }
 }

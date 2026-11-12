@@ -182,7 +182,18 @@ impl ApplicationHandler for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                // The close button goes through the same guard as Ctrl+Q.
+                let quit = match self.editor.as_mut() {
+                    Some(ed) => ed.request_quit() == Control::Quit,
+                    None => true,
+                };
+                if quit {
+                    event_loop.exit();
+                } else if let Some(w) = self.window.as_ref() {
+                    w.request_redraw();
+                }
+            }
             WindowEvent::RedrawRequested => self.redraw(event_loop),
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
             WindowEvent::KeyboardInput { event, .. } => {

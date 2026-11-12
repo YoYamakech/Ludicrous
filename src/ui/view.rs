@@ -18,6 +18,7 @@ pub mod theme {
     pub const STATUS_BG: Color = [0.16, 0.18, 0.21, 1.0];
     pub const STATUS_TEXT: Color = [0.72, 0.76, 0.82, 1.0];
     pub const MODIFIED: Color = [0.95, 0.70, 0.30, 1.0];
+    pub const ERROR: Color = [0.95, 0.45, 0.40, 1.0];
 }
 
 const GUTTER_PAD: f32 = 8.0;
@@ -66,7 +67,12 @@ pub fn draw(r: &mut Renderer, ed: &Editor, l: &Layout) {
         None => "[No Name]",
     };
     r.text(GUTTER_PAD, text_y, name, theme::STATUS_TEXT);
-    if ed.buffer.modified {
+    if let Some(msg) = &ed.status {
+        // A failed save is more urgent than the modified marker, so it takes
+        // that spot in the bar.
+        let mx = GUTTER_PAD + (name.chars().count() + 1) as f32 * l.cell_w;
+        r.text(mx, text_y, msg, theme::ERROR);
+    } else if ed.buffer.modified {
         let mx = GUTTER_PAD + (name.chars().count() + 1) as f32 * l.cell_w;
         r.text(mx, text_y, "[modified]", theme::MODIFIED);
     }

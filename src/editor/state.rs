@@ -2,9 +2,16 @@
 // `apply` is the only place that mutates any of it, so every change (typing,
 // saving, scrolling) follows exactly one path.
 
+use std::time::{Duration, Instant};
+
 use crate::editor::buffer::Buffer;
 use crate::editor::command::Command;
 use crate::editor::cursor::Cursor;
+
+/// How long a quit warning stays armed. A second Ctrl+Q inside this window
+/// discards the unsaved changes; after it, the warning has to be asked for
+/// again.
+const QUIT_ARM_WINDOW: Duration = Duration::from_secs(3);
 
 /// What the app should do after a command has been applied.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -20,6 +27,13 @@ pub struct Editor {
     pub scroll: usize,
     /// How many lines fit in the text area; set by the UI before drawing.
     pub rows: usize,
+    /// Short message for the status bar (e.g. a failed save). Cleared as soon
+    /// as the next command runs, so it never sticks around forever.
+    pub status: Option<String>,
+    /// When the user first asked to quit with unsaved changes. `None` means no
+    /// warning is showing. Kept here (not in app.rs) so the window close button
+    /// and Ctrl+Q share exactly one guard.
+    quit_armed: Option<Instant>,
 }
 
 impl Editor {
@@ -29,10 +43,36 @@ impl Editor {
             cursor: Cursor::new(),
             scroll: 0,
             rows: 1,
+            status: None,
+            quit_armed: None,
         }
     }
 
+    /// Decide whether a quit request may exit. Dirty text arms a warning
+    /// instead; a second request within `QUIT_ARM_WINDOW` goes through.
+    /// Used by both Ctrl+Q and the window close button.
+    pub fn request_quit(&mut self) -> Control {
+        if !self.buffer.modified {
+            return Control::Quit;
+        }
+        if let Some(at) = self.quit_armed {
+            if at.elapsed() < QUIT_ARM_WINDOW {
+                return Control::Quit;
+            }
+        }
+        self.quit_armed = Some(Instant::now());
+        self.status = Some("Unsaved changes: press Ctrl+Q again to discard".to_string());
+        Control::Continue
+    }
+
     pub fn apply(&mut self, cmd: Command) -> Control {
+        // A status message only describes the command that produced it, so any
+        // new command clears it first. Any key other than Ctrl+Q also cancels a
+        // pending quit warning.
+        self.status = None;
+        if cmd != Command::Quit {
+            self.quit_armed = None;
+        }
         match cmd {
             Command::Insert(ch) => {
                 if ch == '\n' || ch == '\r' {
@@ -132,9 +172,12 @@ impl Editor {
             Command::Save => {
                 if let Err(e) = self.buffer.save() {
                     eprintln!("ludicrous: save failed: {e}");
+                    // Keep `modified` set: the text on disk is still the old
+                    // version, so the user must not think the save worked.
+                    self.status = Some(format!("Save failed: {e}"));
                 }
             }
-            Command::Quit => return Control::Quit,
+            Command::Quit => return self.request_quit(),
         }
 
         self.cursor
@@ -251,5 +294,57 @@ mod tests {
     fn quit_returns_control_quit() {
         let mut ed = editor("");
         assert_eq!(ed.apply(Command::Quit), Control::Quit);
+    }
+
+    #[test]
+    fn dirty_quit_warns_then_quits() {
+        let mut ed = editor("text");
+        ed.apply(Command::Insert('!'));
+        assert_eq!(ed.apply(Command::Quit), Control::Continue);
+        assert_eq!(
+            ed.status.as_deref(),
+            Some("Unsaved changes: press Ctrl+Q again to discard")
+        );
+        // Second Ctrl+Q inside the window discards.
+        assert_eq!(ed.apply(Command::Quit), Control::Quit);
+    }
+
+    #[test]
+    fn other_key_cancels_quit_warning() {
+        let mut ed = editor("text");
+        ed.apply(Command::Insert('!'));
+        ed.apply(Command::Quit);
+        ed.apply(Command::Left);
+        assert!(ed.status.is_none());
+        // The warning is disarmed, so the next Ctrl+Q warns again.
+        assert_eq!(ed.apply(Command::Quit), Control::Continue);
+    }
+
+    #[test]
+    fn saving_cancels_quit_warning() {
+        let mut ed = editor("text");
+        ed.apply(Command::Insert('!'));
+        ed.apply(Command::Quit);
+        ed.apply(Command::Save); // fails (no path) but still cancels the warning
+        assert_eq!(ed.apply(Command::Quit), Control::Continue);
+    }
+
+    #[test]
+    fn failed_save_sets_status_and_keeps_dirty() {
+        let mut ed = editor("text");
+        ed.apply(Command::Insert('!'));
+        ed.apply(Command::Save); // no path, so this must fail
+        let msg = ed.status.clone().expect("status message");
+        assert!(msg.starts_with("Save failed:"), "{msg}");
+        assert!(ed.buffer.modified);
+    }
+
+    #[test]
+    fn next_command_clears_status() {
+        let mut ed = editor("text");
+        ed.apply(Command::Save);
+        assert!(ed.status.is_some());
+        ed.apply(Command::Left);
+        assert!(ed.status.is_none());
     }
 }
