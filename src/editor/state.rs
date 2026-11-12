@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use crate::editor::buffer::Buffer;
 use crate::editor::command::Command;
 use crate::editor::cursor::Cursor;
+use crate::editor::history::{Edit, EditKind, History};
 
 /// How long a quit warning stays armed. A second Ctrl+Q inside this window
 /// discards the unsaved changes; after it, the warning has to be asked for
@@ -34,6 +35,8 @@ pub struct Editor {
     /// warning is showing. Kept here (not in app.rs) so the window close button
     /// and Ctrl+Q share exactly one guard.
     quit_armed: Option<Instant>,
+    /// Undo/redo stacks. Also the source of truth for "is this file dirty?".
+    pub history: History,
 }
 
 impl Editor {
@@ -45,14 +48,27 @@ impl Editor {
             rows: 1,
             status: None,
             quit_armed: None,
+            history: History::new(),
         }
+    }
+
+    /// True when the text differs from the last saved version.
+    pub fn is_dirty(&self) -> bool {
+        self.history.is_dirty()
+    }
+
+    /// Keep `Buffer::modified` in step with the history. The buffer flag is
+    /// what the UI and the save path already read, so we mirror it rather than
+    /// duplicating the dirty logic in two places.
+    fn sync_modified(&mut self) {
+        self.buffer.modified = self.history.is_dirty();
     }
 
     /// Decide whether a quit request may exit. Dirty text arms a warning
     /// instead; a second request within `QUIT_ARM_WINDOW` goes through.
     /// Used by both Ctrl+Q and the window close button.
     pub fn request_quit(&mut self) -> Control {
-        if !self.buffer.modified {
+        if !self.is_dirty() {
             return Control::Quit;
         }
         if let Some(at) = self.quit_armed {
@@ -78,30 +94,126 @@ impl Editor {
                 if ch == '\n' || ch == '\r' {
                     return self.apply(Command::Newline);
                 }
+                let before = self.cursor;
                 let (l, c) = (self.cursor.line, self.cursor.col);
+                let pos = self.buffer.char_index(l, c);
                 self.buffer.insert_char(l, c, ch);
                 self.cursor.col += 1;
                 self.cursor.desired_col = self.cursor.col;
+                self.history.record(
+                    Edit::Insert {
+                        pos,
+                        text: ch.to_string(),
+                    },
+                    EditKind::Insert,
+                    before,
+                    self.cursor,
+                    Instant::now(),
+                );
             }
             Command::Newline => {
+                let before = self.cursor;
+                let pos = self.buffer.char_index(self.cursor.line, self.cursor.col);
                 let (l, c) = self
                     .buffer
                     .insert_newline(self.cursor.line, self.cursor.col);
                 self.cursor.line = l;
                 self.cursor.col = c;
                 self.cursor.desired_col = c;
+                self.history.record(
+                    Edit::Insert {
+                        pos,
+                        text: "\n".to_string(),
+                    },
+                    EditKind::Newline,
+                    before,
+                    self.cursor,
+                    Instant::now(),
+                );
             }
             Command::Backspace => {
+                let before = self.cursor;
+                // Work out what is about to disappear before deleting it, so
+                // the history entry can put exactly that text back.
+                let (l, c) = (self.cursor.line, self.cursor.col);
+                let removed = if c > 0 {
+                    self.buffer.char_at(self.buffer.char_index(l, c - 1))
+                } else if l > 0 {
+                    Some('\n')
+                } else {
+                    None
+                };
                 let (l, c) = self.buffer.backspace(self.cursor.line, self.cursor.col);
                 self.cursor.line = l;
                 self.cursor.col = c;
                 self.cursor.desired_col = c;
+                if let Some(ch) = removed {
+                    let pos = self.buffer.char_index(l, c);
+                    self.history.record(
+                        Edit::Delete {
+                            pos,
+                            text: ch.to_string(),
+                        },
+                        EditKind::Delete,
+                        before,
+                        self.cursor,
+                        Instant::now(),
+                    );
+                }
             }
             Command::Delete => {
-                self.buffer.delete(self.cursor.line, self.cursor.col);
+                let before = self.cursor;
+                let (l, c) = (self.cursor.line, self.cursor.col);
+                let removed = self.buffer.char_at(self.buffer.char_index(l, c));
+                self.buffer.delete(l, c);
                 self.cursor.desired_col = self.cursor.col;
+                if let Some(ch) = removed {
+                    let pos = self.buffer.char_index(l, c);
+                    self.history.record(
+                        Edit::Delete {
+                            pos,
+                            text: ch.to_string(),
+                        },
+                        EditKind::Delete,
+                        before,
+                        self.cursor,
+                        Instant::now(),
+                    );
+                }
+            }
+            Command::Undo => {
+                if let Some(entry) = self.history.undo() {
+                    // Walk the edits backwards: the last change is undone first.
+                    for edit in entry.edits.iter().rev() {
+                        match edit {
+                            Edit::Insert { pos, text } => {
+                                self.buffer.remove_at(*pos, text.chars().count());
+                            }
+                            Edit::Delete { pos, text } => {
+                                self.buffer.insert_str_at(*pos, text);
+                            }
+                        }
+                    }
+                    self.cursor = entry.cursor_before;
+                }
+            }
+            Command::Redo => {
+                if let Some(entry) = self.history.redo() {
+                    for edit in entry.edits.iter() {
+                        match edit {
+                            Edit::Insert { pos, text } => {
+                                self.buffer.insert_str_at(*pos, text);
+                            }
+                            Edit::Delete { pos, text } => {
+                                self.buffer.remove_at(*pos, text.chars().count());
+                            }
+                        }
+                    }
+                    self.cursor = entry.cursor_after;
+                }
             }
             Command::Left => {
+                self.history.break_group();
                 if self.cursor.col > 0 {
                     self.cursor.col -= 1;
                 } else if self.cursor.line > 0 {
@@ -111,6 +223,7 @@ impl Editor {
                 self.cursor.desired_col = self.cursor.col;
             }
             Command::Right => {
+                self.history.break_group();
                 if self.cursor.col < self.buffer.line_len(self.cursor.line) {
                     self.cursor.col += 1;
                 } else if self.cursor.line + 1 < self.buffer.line_count() {
@@ -120,6 +233,7 @@ impl Editor {
                 self.cursor.desired_col = self.cursor.col;
             }
             Command::Up => {
+                self.history.break_group();
                 if self.cursor.line > 0 {
                     self.cursor.line -= 1;
                     // Aim for the remembered column, not the clamped one.
@@ -130,6 +244,7 @@ impl Editor {
                 }
             }
             Command::Down => {
+                self.history.break_group();
                 if self.cursor.line + 1 < self.buffer.line_count() {
                     self.cursor.line += 1;
                     self.cursor.col = self
@@ -139,14 +254,17 @@ impl Editor {
                 }
             }
             Command::Home => {
+                self.history.break_group();
                 self.cursor.col = 0;
                 self.cursor.desired_col = 0;
             }
             Command::End => {
+                self.history.break_group();
                 self.cursor.col = self.buffer.line_len(self.cursor.line);
                 self.cursor.desired_col = self.cursor.col;
             }
             Command::PageUp => {
+                self.history.break_group();
                 self.cursor.line = self.cursor.line.saturating_sub(self.rows.max(1));
                 self.cursor.col = self
                     .cursor
@@ -154,6 +272,7 @@ impl Editor {
                     .min(self.buffer.line_len(self.cursor.line));
             }
             Command::PageDown => {
+                self.history.break_group();
                 let last = self.buffer.line_count().saturating_sub(1);
                 self.cursor.line = (self.cursor.line + self.rows.max(1)).min(last);
                 self.cursor.col = self
@@ -170,11 +289,14 @@ impl Editor {
                 self.scroll = next as usize;
             }
             Command::Save => {
+                self.history.break_group();
                 if let Err(e) = self.buffer.save() {
                     eprintln!("ludicrous: save failed: {e}");
-                    // Keep `modified` set: the text on disk is still the old
+                    // Keep the buffer dirty: the text on disk is still the old
                     // version, so the user must not think the save worked.
                     self.status = Some(format!("Save failed: {e}"));
+                } else {
+                    self.history.mark_saved();
                 }
             }
             Command::Quit => return self.request_quit(),
@@ -182,6 +304,7 @@ impl Editor {
 
         self.cursor
             .clamp(self.buffer.line_count(), |l| self.buffer.line_len(l));
+        self.sync_modified();
         Control::Continue
     }
 
@@ -346,5 +469,76 @@ mod tests {
         assert!(ed.status.is_some());
         ed.apply(Command::Left);
         assert!(ed.status.is_none());
+    }
+
+    #[test]
+    fn undo_removes_typed_text_and_redo_puts_it_back() {
+        let mut ed = editor("");
+        ed.apply(Command::Insert('a'));
+        ed.apply(Command::Insert('b'));
+        assert!(ed.is_dirty());
+        ed.apply(Command::Undo);
+        assert_eq!(ed.buffer.line(0), "");
+        assert_eq!((ed.cursor.line, ed.cursor.col), (0, 0));
+        ed.apply(Command::Redo);
+        assert_eq!(ed.buffer.line(0), "ab");
+        assert_eq!((ed.cursor.line, ed.cursor.col), (0, 2));
+    }
+
+    #[test]
+    fn undo_restores_a_deleted_newline() {
+        let mut ed = editor("ab\ncd");
+        ed.apply(Command::Down);
+        ed.apply(Command::Backspace); // joins the lines
+        assert_eq!(ed.buffer.line(0), "abcd");
+        ed.apply(Command::Undo);
+        assert_eq!(ed.buffer.line(0), "ab");
+        assert_eq!(ed.buffer.line(1), "cd");
+        assert_eq!((ed.cursor.line, ed.cursor.col), (1, 0));
+    }
+
+    #[test]
+    fn undo_restores_a_deleted_character() {
+        let mut ed = editor("abc");
+        ed.apply(Command::Delete);
+        assert_eq!(ed.buffer.line(0), "bc");
+        ed.apply(Command::Undo);
+        assert_eq!(ed.buffer.line(0), "abc");
+    }
+
+    #[test]
+    fn undo_after_save_makes_the_file_dirty_again() {
+        let dir = std::env::temp_dir().join("ludicrous-test-undo-save");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("undo.txt");
+        std::fs::write(&path, "hi").unwrap();
+        let mut ed = Editor::new(Buffer::open(&path).unwrap());
+        ed.apply(Command::Insert('!'));
+        ed.apply(Command::Save);
+        assert!(!ed.is_dirty());
+        ed.apply(Command::Undo);
+        assert!(ed.is_dirty());
+        ed.apply(Command::Redo);
+        assert!(!ed.is_dirty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn undo_with_empty_history_is_a_noop() {
+        let mut ed = editor("abc");
+        ed.apply(Command::Undo);
+        assert_eq!(ed.buffer.line(0), "abc");
+        assert!(!ed.is_dirty());
+    }
+
+    #[test]
+    fn moving_the_cursor_starts_a_new_undo_group() {
+        let mut ed = editor("");
+        ed.apply(Command::Insert('a'));
+        ed.apply(Command::Left);
+        ed.apply(Command::Insert('b'));
+        ed.apply(Command::Undo);
+        // Only the 'b' goes away; the 'a' was in an earlier group.
+        assert_eq!(ed.buffer.line(0), "a");
     }
 }

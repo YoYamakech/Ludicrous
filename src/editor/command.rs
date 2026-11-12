@@ -17,6 +17,8 @@ pub enum Command {
     PageDown,
     /// Scroll by a number of lines (positive = down).
     Scroll(f32),
+    Undo,
+    Redo,
     Save,
     Quit,
 }

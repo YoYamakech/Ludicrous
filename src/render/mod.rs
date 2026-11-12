@@ -274,9 +274,11 @@ impl Renderer {
         if w <= 0.0 || h <= 0.0 || color[3] <= 0.0 {
             return;
         }
-        // A shape queued after text must paint over it, so flush the glyphs.
+        // A shape queued after text must paint over it. Flush *both* batches:
+        // rects are only uploaded at flush time, so flushing the glyphs alone
+        // would let an earlier background rect land on top of the text.
         if !self.glyphs.data.is_empty() || !self.ui_glyphs.data.is_empty() {
-            self.flush_text();
+            self.flush_batches();
         }
         let s = self.scale;
         let clip = self.current_clip();
@@ -329,6 +331,19 @@ impl Renderer {
             color,
             clip,
         );
+    }
+
+    /// X of the pen for character `col` of a line starting at `x`, in points.
+    ///
+    /// This repeats exactly what `queue_text` does (round the base, then add
+    /// the unrounded advance, then round again), so a caret drawn here lands
+    /// on the same pixel column as the glyph it sits in front of. Using
+    /// `x + col * cell_w` directly drifts by a pixel or two because the
+    /// advance is fractional (9.03 px for the bundled font).
+    pub fn text_pen_x(&self, x: f32, col: usize) -> f32 {
+        let s = self.scale;
+        let base = (x * s).round();
+        ((base + col as f32 * self.atlas.cell_w).round()) / s
     }
 
     /// Width of `s` in points at the editor size.

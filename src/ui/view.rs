@@ -48,9 +48,11 @@ pub fn draw(r: &mut Renderer, ed: &Editor, l: &Layout) {
     }
 
     // Cursor: a thin vertical bar at the character cell under the cursor.
+    // The x comes from the renderer's pen position, not `col * cell_w`, so it
+    // lines up with the glyphs (see issue #1: fractional advance drift).
     if ed.cursor.line >= first && ed.cursor.line < last {
         let y = l.text_y + (ed.cursor.line - first) as f32 * l.cell_h;
-        let x = l.text_x + ed.cursor.col as f32 * l.cell_w;
+        let x = r.text_pen_x(l.text_x, ed.cursor.col);
         r.rect(x, y, CURSOR_W, l.cell_h, theme::CURSOR);
     }
 

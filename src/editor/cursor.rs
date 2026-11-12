@@ -2,6 +2,7 @@
 // `desired_col` remembers the column the user aimed for, so moving up through
 // a short line and back down returns to the original column.
 
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Cursor {
     pub line: usize,
     pub col: usize,

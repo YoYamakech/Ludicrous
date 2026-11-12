@@ -60,6 +60,33 @@ impl Buffer {
         self.rope.line_to_char(line) + col
     }
 
+    /// Character index (not bytes) of a line/column pair. History stores
+    /// positions this way so an edit stays valid across the whole file.
+    pub fn char_index(&self, line: usize, col: usize) -> usize {
+        self.index(line, col)
+    }
+
+    /// The character at a character index, if it exists.
+    pub fn char_at(&self, i: usize) -> Option<char> {
+        if i < self.rope.len_chars() {
+            Some(self.rope.char(i))
+        } else {
+            None
+        }
+    }
+
+    /// Insert a whole string at a character index (used by undo/redo).
+    pub fn insert_str_at(&mut self, i: usize, text: &str) {
+        self.rope.insert(i, text);
+        self.modified = true;
+    }
+
+    /// Remove `len` characters starting at a character index.
+    pub fn remove_at(&mut self, i: usize, len: usize) {
+        self.rope.remove(i..i + len);
+        self.modified = true;
+    }
+
     pub fn insert_char(&mut self, line: usize, col: usize, ch: char) {
         let i = self.index(line, col);
         self.rope.insert_char(i, ch);

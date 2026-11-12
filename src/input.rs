@@ -15,6 +15,9 @@ pub fn key(event: &KeyEvent, mods: ModifiersState) -> Option<Command> {
             Key::Character(ref c) => match c.as_str().to_ascii_lowercase().as_str() {
                 "s" => Some(Command::Save),
                 "q" => Some(Command::Quit),
+                "z" if mods.shift_key() => Some(Command::Redo),
+                "z" => Some(Command::Undo),
+                "y" => Some(Command::Redo),
                 _ => None,
             },
             _ => None,
