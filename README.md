@@ -12,6 +12,8 @@ OpenGL 3.3 renderer. No Electron, no wgpu, no Vulkan.
 - Redraws only when something changes (`ControlFlow::Wait`); the caret blinks with
   `WaitUntil`, never a busy loop
 - A hand-drawn shell: rounded window, its own title bar, sidebar, settings page
+- File-type icons from a 5 KB Nerd Font subset; native file dialogs and
+  drag-and-drop through one `Workspace::open_path`
 
 ## What it is not
 
@@ -45,6 +47,7 @@ sudo apt-get install -y libxkbcommon-dev libx11-dev libxcursor-dev \
 | Shift + movement | Select |
 | Mouse wheel, click | Scroll, place the caret |
 | Enter, Backspace, Delete, Tab | Edit (Tab / Shift+Tab indent) |
+| Ctrl+O / Ctrl+Shift+O | Open file(s) / open folder |
 | Ctrl+S | Save |
 | Ctrl+Z / Ctrl+Shift+Z | Undo / redo |
 | Ctrl+C / Ctrl+X / Ctrl+V | Clipboard |

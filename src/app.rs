@@ -13,7 +13,7 @@ use glutin_winit::DisplayBuilder;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::keyboard::ModifiersState;
 use winit::raw_window_handle::HasWindowHandle;
 use winit::window::{CursorIcon, Fullscreen, Window, WindowId};
@@ -42,6 +42,25 @@ const ICONS: &[u8] = include_bytes!("../assets/icons.ttf");
 // Nerd Font Symbols, subset to the file-type glyphs in `ui/icons_map.rs`.
 const SYMBOLS: &[u8] = include_bytes!("../assets/symbols.ttf");
 
+/// Everything a background thread may tell the UI thread.
+///
+/// The proxy is the *only* wake-up path from a worker: send the payload, then
+/// the loop runs `user_event`, which does the small amount of UI work and
+/// requests exactly one redraw. No polling, no timers, no async runtime.
+#[derive(Debug)]
+pub enum UserEvent {
+    /// A file or folder dialog finished. `None` means the dialog was
+    /// unavailable (no portal) or failed outright; `Some(vec![])` is a cancel.
+    DialogResult(
+        crate::workspace::DialogKind,
+        Option<Vec<std::path::PathBuf>>,
+    ),
+}
+
+/// The notifier handed to background modules. `ui/` and `workspace/` never see
+/// winit: they receive a `Notify` closure built here.
+pub type Proxy = EventLoopProxy<UserEvent>;
+
 struct GlState {
     surface: Surface<WindowSurface>,
     context: PossiblyCurrentContext,
@@ -50,6 +69,10 @@ struct GlState {
 
 pub struct App {
     path: Option<PathBuf>,
+    /// Sends messages from background threads to this event loop.
+    proxy: Proxy,
+    /// The one dialog slot; a second request while one is open is ignored.
+    dialogs: crate::workspace::DialogState,
     window: Option<Window>,
     gl: Option<GlState>,
     workspace: Option<Workspace>,
@@ -117,9 +140,11 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(path: Option<PathBuf>) -> Self {
+    pub fn new(path: Option<PathBuf>, proxy: Proxy) -> Self {
         Self {
             path,
+            proxy,
+            dialogs: crate::workspace::DialogState::default(),
             window: None,
             gl: None,
             workspace: None,
@@ -129,7 +154,10 @@ impl App {
             hover: None,
             hitmap: HitMap::new(),
             current_cursor: CursorKind::Default,
-            drop_hover: false,
+            // Dev aid, in the same spirit as LUDICROUS_GL_SAFE: forces the drop
+            // highlight on so the draw path can be checked without a file
+            // manager that speaks XDND.
+            drop_hover: std::env::var_os("LUDICROUS_DEBUG_DROP").is_some(),
             pending_drops: Vec::new(),
             sidebar_manual: None,
             auto_mode: 0,
@@ -721,6 +749,64 @@ impl App {
         }
     }
 
+    /// Ask for a native dialog. Runs on its own thread; the result arrives as
+    /// `UserEvent::DialogResult`. With no portal the thread reports
+    /// `None` and the status bar explains the command-line route.
+    fn request_dialog(&mut self, kind: crate::workspace::DialogKind) {
+        let Some(request) = self.dialogs.begin(kind) else {
+            return; // one dialog at a time
+        };
+        let proxy = self.proxy.clone();
+        request.spawn(move |kind, paths| {
+            // A closed loop or a full queue must not panic a worker thread.
+            let _ = proxy.send_event(UserEvent::DialogResult(kind, paths));
+        });
+    }
+
+    /// Apply a dialog result. `None` means the dialog could not be shown.
+    fn dialog_result(&mut self, kind: crate::workspace::DialogKind, paths: Option<Vec<PathBuf>>) {
+        if !self.dialogs.finish(kind) {
+            return; // a stale reply for a dialog that is no longer open
+        }
+        let Some(paths) = paths else {
+            self.status_hint(kind.unavailable_hint());
+            if let Some(w) = self.window.as_ref() {
+                w.request_redraw();
+            }
+            return;
+        };
+        if paths.is_empty() {
+            return; // cancelled: nothing to say
+        }
+        self.open_paths(&paths);
+    }
+
+    /// Open a batch of paths through the one entry point and report the outcome
+    /// in the status bar. A whole drop batch is one call, so it is one redraw.
+    fn open_paths(&mut self, paths: &[PathBuf]) {
+        let Some(ws) = self.workspace.as_mut() else {
+            return;
+        };
+        let mut message = None;
+        for path in paths {
+            match ws.open_path(path) {
+                crate::workspace::OpenResult::Failed(msg) => message = Some(msg),
+                crate::workspace::OpenResult::RootChanged => {
+                    message = Some(format!("Opened folder {}", path.display()));
+                }
+                _ => {}
+            }
+        }
+        // The new root has its own tree and the active buffer may have changed,
+        // so the map and the cursor must be refreshed even without a mouse move.
+        self.sidebar.scroll = 0.0;
+        self.sidebar.selected = 0;
+        if let Some(msg) = message {
+            self.status_hint(&msg);
+        }
+        self.layout_changed();
+    }
+
     /// A short-lived status message in the editor's status bar.
     fn status_hint(&mut self, msg: &str) {
         if let Some(ed) = self.workspace.as_mut().and_then(|w| w.active_editor_mut()) {
@@ -992,6 +1078,7 @@ impl App {
             hover,
             focus: self.focus,
             caret: self.blink_on || !self.config.cursor_blink,
+            drop_hover: self.drop_hover,
             sidebar: self.sidebar.clone(),
             palette,
             settings: self.settings_open,
@@ -1113,7 +1200,7 @@ fn resize_edge(dir: ResizeDirection) -> winit::window::ResizeDirection {
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() {
             if let Err(e) = self.create_window(event_loop) {
@@ -1126,6 +1213,14 @@ impl ApplicationHandler for App {
     /// Blink the caret without ever busy-waiting: when blinking is on we ask
     /// for a wake-up at the next flip, otherwise we sleep until input.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // A dropped batch is complete once the event queue is empty: all the
+        // `DroppedFile` events for one drag arrive together, so processing them
+        // here is one call and one redraw instead of one per file. This runs
+        // only when something was actually dropped, never on idle.
+        if !self.pending_drops.is_empty() {
+            let paths = std::mem::take(&mut self.pending_drops);
+            self.open_paths(&paths);
+        }
         if !self.config.cursor_blink {
             self.blink_on = true;
             event_loop.set_control_flow(ControlFlow::Wait);
@@ -1140,6 +1235,14 @@ impl ApplicationHandler for App {
             }
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(self.blink_at));
+    }
+
+    /// Background threads deliver here, on the UI thread. Keep this small: a
+    /// message is a payload plus at most one redraw request.
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::DialogResult(kind, paths) => self.dialog_result(kind, paths),
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -1258,6 +1361,17 @@ impl ApplicationHandler for App {
                     let is_tab = matches!(&event.logical_key, Key::Named(NamedKey::Tab));
                     let is_w = matches!(&event.logical_key,
                         Key::Character(c) if c.as_str().eq_ignore_ascii_case("w"));
+                    let is_o = matches!(&event.logical_key,
+                        Key::Character(c) if c.as_str().eq_ignore_ascii_case("o"));
+                    if is_o {
+                        // Ctrl+Shift+O opens a folder, Ctrl+O files.
+                        self.request_dialog(if self.mods.shift_key() {
+                            crate::workspace::DialogKind::OpenFolder
+                        } else {
+                            crate::workspace::DialogKind::OpenFiles
+                        });
+                        return;
+                    }
                     if is_tab {
                         if let Some(ws) = self.workspace.as_mut() {
                             ws.cycle(!self.mods.shift_key());
@@ -1409,13 +1523,8 @@ impl ApplicationHandler for App {
                         self.layout_changed();
                     }
                     Some(Target::ProjectCard) => {
-                        // v1.2 section 5.1 makes the card open a folder; the
-                        // dialog lands in Phase 2. Until then the region still
-                        // exists, so the cursor and hover do not lie.
-                        self.status_hint("Ctrl+Shift+O");
-                        if let Some(w) = self.window.as_ref() {
-                            w.request_redraw();
-                        }
+                        // v1.2 section 5.1: clicking the card opens a folder.
+                        self.request_dialog(crate::workspace::DialogKind::OpenFolder);
                     }
                     Some(Target::SettingsRow { row, part }) => {
                         self.settings_row = row;

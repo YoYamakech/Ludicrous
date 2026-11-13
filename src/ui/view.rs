@@ -36,6 +36,9 @@ pub struct Chrome<'a> {
     pub buttons_left: bool,
     /// False during the dark half of a blinking cursor.
     pub caret: bool,
+    /// True while files are being dragged over the window: draw the drop
+    /// highlight (v1.2 section 5.2).
+    pub drop_hover: bool,
 }
 
 pub fn draw(r: &mut Renderer, ws: &Workspace, l: &Layout, chrome: &Chrome) {
@@ -60,6 +63,32 @@ pub fn draw(r: &mut Renderer, ws: &Workspace, l: &Layout, chrome: &Chrome) {
         draw_editor(r, ed, l, p, chrome.caret);
     }
     draw_status_bar(r, ed, l, p);
+
+    // Drop highlight: a 2 px accent ring around the whole window, on top of
+    // everything, plus one short line of text. Both disappear with the drop.
+    if chrome.drop_hover {
+        r.rounded_outline(
+            1.0,
+            1.0,
+            l.width - 2.0,
+            l.height - 2.0,
+            radius,
+            2.0,
+            p.accent,
+        );
+        let label = "Drop to open";
+        let w = r.ui_text_width(label);
+        let (cx, cy) = (l.width * 0.5, l.height * 0.5);
+        r.rounded_rect(
+            cx - w * 0.5 - 10.0,
+            cy - 11.0,
+            w + 20.0,
+            22.0,
+            5.0,
+            p.sidebar_bg,
+        );
+        r.text_ui(cx - w * 0.5, cy - 6.5, label, p.text);
+    }
 
     // Border last, so it sits on top of the panels' edges.
     if !chrome.maximized {

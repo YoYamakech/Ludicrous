@@ -25,14 +25,22 @@ pub struct Workspace {
     indent: usize,
 }
 
-/// What happened when a file was opened. The app uses this to decide whether
-/// the window needs a redraw and whether to report an error.
+/// Files larger than this are refused with a message instead of being loaded.
+/// The target laptop has 4 GB of RAM; a 32 MB source file is already absurd.
+pub const MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
+
+/// What happened when a file or folder was opened. The app uses this to decide
+/// whether the window needs a redraw and what to report in the status bar.
 #[derive(Debug, PartialEq)]
 pub enum OpenResult {
     /// A new buffer was created at index `usize`.
     Opened(usize),
     /// The file was already open; we just switched to `usize`.
     Switched(usize),
+    /// A directory became the project root. Open buffers stay open.
+    RootChanged,
+    /// The path was refused; the string is the message for the status bar.
+    Failed(String),
 }
 
 impl Workspace {
@@ -128,6 +136,53 @@ impl Workspace {
         self.quit_ok.push(false);
         self.active = self.buffers.len() - 1;
         Ok(OpenResult::Opened(self.active))
+    }
+
+    /// The one way anything opens a path: the command line, a dialog, a drop,
+    /// a file-tree click. Directories set the root; files become buffers.
+    ///
+    /// Rules (v1.2 section 5.1): an already-open file just becomes active; a
+    /// directory sets the root and rebuilds the tree lazily without closing
+    /// buffers; oversized, binary and unreadable paths are refused with a
+    /// message, never a panic.
+    pub fn open_path(&mut self, path: &Path) -> OpenResult {
+        let path = path.to_path_buf();
+
+        // A path that is not there is refused before anything else: it is
+        // neither a file to open nor a folder to show.
+        if !path.exists() {
+            return OpenResult::Failed(format!("{}: no such file or folder", path.display()));
+        }
+
+        // A directory: new root, tree rebuilt from scratch (lazy, so no scan).
+        if path.is_dir() {
+            let display = path.display().to_string();
+            self.root = Some(path.clone());
+            self.tree.set_root(Some(path));
+            // The message carries the folder so the app can announce it once.
+            return match std::fs::read_dir(&display) {
+                Ok(_) => OpenResult::RootChanged,
+                Err(e) => OpenResult::Failed(format!("{display}: {e}")),
+            };
+        }
+
+        // Refuse huge files before reading a byte: the check is metadata only.
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if meta.len() > MAX_FILE_BYTES {
+                return OpenResult::Failed(format!(
+                    "{} is too large ({} MB, limit {} MB)",
+                    path.display(),
+                    meta.len() / (1024 * 1024),
+                    MAX_FILE_BYTES / (1024 * 1024)
+                ));
+            }
+        }
+
+        // `open_file` already handles "already open" and the empty-buffer reuse.
+        match self.open_file(&path) {
+            Ok(result) => result,
+            Err(msg) => OpenResult::Failed(msg),
+        }
     }
 
     fn index_of(&self, path: &Path) -> Option<usize> {
@@ -434,5 +489,102 @@ mod tests {
             line_ending: crate::editor::buffer::LineEnding::Lf,
         });
         assert_eq!(buffer_name(&ed), "[No Name]");
+    }
+
+    #[test]
+    fn open_path_opens_a_file_and_switches_to_it_again() {
+        let path = tmp("openpath", "one");
+        let mut ws = Workspace::new();
+        assert!(matches!(ws.open_path(&path), OpenResult::Opened(0)));
+        assert_eq!(ws.active_editor().unwrap().buffer.line(0), "one");
+        // The same path again is a switch, not a second buffer.
+        assert!(matches!(ws.open_path(&path), OpenResult::Switched(0)));
+        assert_eq!(ws.buffers.len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_path_on_a_directory_sets_the_root_and_keeps_buffers() {
+        let file = tmp("openpath-dir", "kept");
+        let dir = file.parent().unwrap().to_path_buf();
+        let mut ws = Workspace::new();
+        ws.open_path(&file);
+        let before = ws.buffers.len();
+        assert_eq!(ws.open_path(&dir), OpenResult::RootChanged);
+        assert_eq!(ws.root.as_deref(), Some(dir.as_path()));
+        // Opening a folder must never close what is already open.
+        assert_eq!(ws.buffers.len(), before);
+        assert_eq!(ws.active_editor().unwrap().buffer.line(0), "kept");
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn open_path_refuses_a_missing_file_with_a_message() {
+        let mut ws = Workspace::new();
+        match ws.open_path(Path::new("/definitely/not/here.txt")) {
+            OpenResult::Failed(msg) => assert!(msg.contains("not/here.txt")),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        // Nothing was opened and the empty buffer is still there.
+        assert_eq!(ws.buffers.len(), 1);
+        assert!(ws.active_editor().unwrap().path().is_none());
+    }
+
+    #[test]
+    fn opening_a_batch_activates_the_last_file() {
+        // The app loops over `open_path`; the order rule lives here so a batch
+        // from a dialog or a drop behaves the same.
+        let a = tmp("batch-a", "a");
+        let b = tmp("batch-b", "b");
+        let mut ws = Workspace::new();
+        ws.open_path(&a);
+        ws.open_path(&b);
+        assert_eq!(ws.active, 1);
+        assert_eq!(ws.active_editor().unwrap().buffer.line(0), "b");
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn a_missing_path_is_neither_a_file_nor_a_folder() {
+        let mut ws = Workspace::new();
+        let result = ws.open_path(Path::new("/proc/definitely-not-here"));
+        match result {
+            OpenResult::Failed(msg) => assert!(msg.contains("no such file or folder")),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        // A failed open must not move the project root or add a buffer.
+        assert!(ws.root.is_none());
+        assert_eq!(ws.buffers.len(), 1);
+    }
+
+    #[test]
+    fn a_directory_with_unreadable_contents_still_becomes_the_root() {
+        // The root is set even when the listing fails, so the sidebar can show
+        // "unreadable" instead of silently ignoring the click.
+        let dir = std::env::temp_dir().join("ludicrous-ws-unreadable");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ws = Workspace::new();
+        assert_eq!(ws.open_path(&dir), OpenResult::RootChanged);
+        assert_eq!(ws.root.as_deref(), Some(dir.as_path()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_mixed_batch_sets_the_root_and_opens_the_files() {
+        // A drop can contain a folder and files: the folder becomes the root,
+        // the files still open (v1.2 section 5.2).
+        let dir = std::env::temp_dir().join("ludicrous-ws-mixed");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "mixed").unwrap();
+
+        let mut ws = Workspace::new();
+        assert_eq!(ws.open_path(&dir), OpenResult::RootChanged);
+        assert!(matches!(ws.open_path(&file), OpenResult::Opened(0)));
+        assert_eq!(ws.root.as_deref(), Some(dir.as_path()));
+        assert_eq!(ws.active_editor().unwrap().buffer.line(0), "mixed");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

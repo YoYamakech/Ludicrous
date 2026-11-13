@@ -12,6 +12,10 @@ glow = "0.18.0"
 ropey = "1.6.1"
 fontdue = "0.9.5"
 arboard = { version = "3.6.1", default-features = false }
+# File dialogs. `xdg-portal` is the lightweight backend: no GTK linked in, no
+# portal traffic until a dialog is actually opened. `rfd` 0.18 defaults to
+# [xdg-portal, wayland]; we keep only the portal, which talks over D-Bus.
+rfd = { version = "0.18", default-features = false, features = ["xdg-portal"], optional = true }
 
 # Heavy, optional features. All on by default, so a plain `cargo build` is the
 # full editor; turn them off for a fast edit/compile loop on the old laptop:
@@ -26,7 +30,7 @@ default = ["syntax", "lsp", "updater", "dialogs"]
 syntax = []
 lsp = []
 updater = []
-dialogs = []
+dialogs = ["dep:rfd"]
 
 # Release: small and fast. A debug build is only for working on the code.
 [profile.release]
