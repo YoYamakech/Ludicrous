@@ -512,6 +512,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_panel_never_starts_above_the_title_bar() {
+        // Issue #6.7: the page must begin below the title bar, so nothing can
+        // bleed over its text or buttons.
+        let l = Layout {
+            width: 1100.0,
+            height: 700.0,
+            cell_w: 9.0,
+            cell_h: 18.0,
+            title_h: 30.0,
+            sidebar_w: 220.0,
+            gutter_w: 44.0,
+            show_numbers: true,
+            text_x: 272.0,
+            text_y: 30.0,
+            text_w: 820.0,
+            status_h: 24.0,
+            rows: 36,
+            cols: 91,
+        };
+        let geo = Geometry::new(&l);
+        assert!(
+            geo.y > l.title_h,
+            "panel top {} vs title {}",
+            geo.y,
+            l.title_h
+        );
+        // And the whole page fits inside the editing area horizontally.
+        assert!(geo.x >= l.sidebar_w - 0.01);
+        assert!(geo.x + geo.w <= l.width + 0.01);
+    }
+
+    #[test]
     fn the_spec_defaults_are_reachable_from_the_rows() {
         let cfg = Config::default();
         assert!(matches!(

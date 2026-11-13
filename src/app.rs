@@ -1496,6 +1496,9 @@ impl App {
                     segment: self.settings_hover_seg,
                 },
             );
+            // Balance the clip: everything after this (the F3 panel) must be
+            // able to draw over the title bar.
+            r.pop_clip();
         }
 
         // F3 overlay: drawn last so it sits over everything, and skipped
