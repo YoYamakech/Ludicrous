@@ -23,10 +23,12 @@ pub enum Widget<'a> {
     Toggle(bool),
     /// `- value +` stepper.
     Stepper(&'a str),
-    /// Segmented row: one labelled choice per option, `index` selected.
+    /// Segmented row: one labelled choice per option, `index` selected and
+    /// `hover` the option under the pointer, if any.
     Choice {
         options: &'a [&'a str],
         index: usize,
+        hover: Option<usize>,
     },
     /// A button that does something instead of holding a value (v1.2 section
     /// 10: "add one more, an action row for buttons like `Check now`").
@@ -63,11 +65,16 @@ impl RowGeom {
             }
             Widget::Action { .. } => vec![(self.control_x, CONTROL_W, 0)],
             Widget::Choice { options, .. } => {
-                let n = options.len().max(1);
-                let seg = CONTROL_W / n as f32;
-                (0..n)
-                    .map(|k| (self.control_x + k as f32 * seg, seg, k))
-                    .collect()
+                // Same widths the drawing uses, so a click lands on the option
+                // under the pointer rather than on the neighbour (#6.1).
+                let widths = choice_segments(options);
+                let mut x = self.control_x;
+                let mut out = Vec::with_capacity(widths.len());
+                for (k, w) in widths.into_iter().enumerate() {
+                    out.push((x, w, k));
+                    x += w;
+                }
+                out
             }
         }
     }
@@ -88,7 +95,7 @@ impl RowGeom {
 
 /// Draw the label on the left and the control on the right of the row.
 /// `x`/`w` span the row; `y` is its top edge.
-#[allow(clippy::too_many_arguments)] // all seven are distinct drawing inputs
+#[allow(clippy::too_many_arguments)] // all eight are distinct drawing inputs
 pub fn draw_row(
     r: &mut Renderer,
     p: &Palette,
@@ -98,6 +105,7 @@ pub fn draw_row(
     label: &str,
     widget: &Widget,
     focused: bool,
+    hovered: bool,
 ) -> RowGeom {
     let h = ROW_H;
     // Focus ring: a subtle pill behind the whole row.
@@ -114,12 +122,30 @@ pub fn draw_row(
     r.text_ui(x, y + (h - 13.0) * 0.5, label, p.text);
 
     let control_x = x + w - CONTROL_W;
+    // The hover wash goes *here*, between the label and the control, and
+    // never after the control: drawing it last is what made the label vanish
+    // under the pointer (issue #6.3). It also only marks the control column,
+    // not the whole row, so the label keeps its full contrast.
+    if hovered && !focused {
+        r.rounded_rect(
+            control_x - 2.0,
+            y + 6.0,
+            CONTROL_W + 4.0,
+            28.0,
+            4.0,
+            p.pill_hover,
+        );
+    }
     let geom = RowGeom { control_x };
     match widget {
         Widget::Toggle(on) => draw_toggle(r, p, control_x + CONTROL_W - 40.0, y, *on),
         Widget::Stepper(value) => draw_stepper(r, p, control_x + CONTROL_W - STEP_W, y, value),
-        Widget::Choice { options, index } => {
-            draw_choice(r, p, control_x, y, options, *index);
+        Widget::Choice {
+            options,
+            index,
+            hover,
+        } => {
+            draw_choice(r, p, control_x, y, options, *index, *hover);
         }
         Widget::Action { label, enabled } => {
             draw_action(r, p, control_x, y, label, *enabled);
@@ -152,21 +178,78 @@ fn draw_stepper(r: &mut Renderer, p: &Palette, x: f32, y: f32, value: &str) {
     r.rect(plus + 11.0, top + h * 0.5 - 5.0, 2.0, 10.0, p.muted);
 }
 
-fn draw_choice(r: &mut Renderer, p: &Palette, x: f32, y: f32, options: &[&str], index: usize) {
+/// The widths of a choice row's segments, in points.
+///
+/// Each segment is weighted by its label's length plus padding, and the row is
+/// scaled to fill the control column exactly. The UI font is monospaced, so
+/// weighting by characters is the same proportion as weighting by measured
+/// text width — which lets the hit map (no renderer) and the drawing agree on
+/// one function (issue #6.1: `expanded` used to get the same room as `rail`).
+pub fn choice_segments(options: &[&str]) -> Vec<f32> {
+    /// Padding on both sides of a label, in character widths. Four leaves room
+    /// for the 4 px inset of the selected pill on each side.
+    const PAD_CHARS: f32 = 4.0;
+    let n = options.len().max(1);
+    let weights: Vec<f32> = options
+        .iter()
+        .map(|o| (o.chars().count() as f32).max(1.0) + PAD_CHARS)
+        .collect();
+    let total: f32 = weights.iter().sum();
+    if total <= 0.0 {
+        return vec![CONTROL_W / n as f32; n];
+    }
+    weights.iter().map(|w| w * CONTROL_W / total).collect()
+}
+
+fn draw_choice(
+    r: &mut Renderer,
+    p: &Palette,
+    x: f32,
+    y: f32,
+    options: &[&str],
+    index: usize,
+    hover: Option<usize>,
+) {
     let h = 24.0;
     let top = y + (ROW_H - h) * 0.5;
-    let seg = CONTROL_W / options.len().max(1) as f32;
     r.rounded_rect(x, top, CONTROL_W, h, 4.0, p.pill_active);
+    let widths = choice_segments(options);
+    let mut sx = x;
     for (i, option) in options.iter().enumerate() {
-        let sx = x + i as f32 * seg;
-        if i == index {
-            r.rounded_rect(sx + 2.0, top + 2.0, seg - 4.0, h - 4.0, 3.0, p.border);
+        let seg = widths.get(i).copied().unwrap_or(0.0);
+        // Hover on a segment that is not selected: a faint wash, drawn before
+        // its label. The selected pill wins over it, so they never stack.
+        if hover == Some(i) && i != index && seg > 4.0 {
+            r.rounded_rect(sx + 2.0, top + 3.0, seg - 4.0, h - 6.0, 3.0, p.pill_hover);
         }
-        // Centre the label in its segment.
+        if i == index && seg > 4.0 {
+            // Fill first, border, then the label on top: drawing text before
+            // the pill is what made hovered/selected labels vanish (#6.3).
+            let pw = seg - 4.0;
+            r.rounded_rect(sx + 2.0, top + 2.0, pw, h - 4.0, 3.0, p.pill_selected);
+            r.rounded_outline(
+                sx + 2.0,
+                top + 2.0,
+                pw,
+                h - 4.0,
+                3.0,
+                1.0,
+                p.pill_selected_border,
+            );
+        }
         let tw = r.ui_text_width(option);
-        let tx = sx + (seg - tw) * 0.5;
-        let color = if i == index { p.text } else { p.muted };
+        let tx = sx + (seg - tw).max(0.0) * 0.5;
+        let color = if i == index {
+            p.pill_selected_text
+        } else if hover == Some(i) {
+            // Hover brightens the label rather than muting it: the pointer
+            // must never make text harder to read (#6.3).
+            p.text
+        } else {
+            p.muted
+        };
         r.text_ui(tx, y + (ROW_H - 13.0) * 0.5, option, color);
+        sx += seg;
     }
 }
 
@@ -215,10 +298,46 @@ mod tests {
         let w = Widget::Choice {
             options: &["2", "4", "8"],
             index: 1,
+            hover: None,
         };
-        assert_eq!(g.part(10.0, &w), Some(0));
+        assert_eq!(g.part(1.0, &w), Some(0));
         assert_eq!(g.part(CONTROL_W * 0.5, &w), Some(1));
         assert_eq!(g.part(CONTROL_W - 1.0, &w), Some(2));
+    }
+
+    #[test]
+    fn segments_fill_the_column_and_favour_longer_labels() {
+        for options in [
+            &["2", "4", "8"][..],
+            &["auto", "expanded", "rail", "hidden"][..],
+            &["dark", "light"][..],
+            &["left", "right"][..],
+            &["single"][..],
+        ] {
+            let widths = choice_segments(options);
+            assert_eq!(widths.len(), options.len());
+            let total: f32 = widths.iter().sum();
+            // The row must end exactly at the control column's right edge: a
+            // gap or overhang is what made the pill look clipped (#6.1).
+            assert!(
+                (total - CONTROL_W).abs() < 0.01,
+                "{options:?} totals {total}, not {CONTROL_W}"
+            );
+            assert!(widths.iter().all(|w| *w > 0.0));
+            // A longer label never gets a narrower segment.
+            for i in 1..options.len() {
+                if options[i].len() > options[i - 1].len() {
+                    assert!(
+                        widths[i] >= widths[i - 1],
+                        "{options:?}: {:?} narrower than its shorter neighbour",
+                        widths
+                    );
+                }
+            }
+        }
+        // `expanded` is visibly wider than `rail`.
+        let w = choice_segments(&["auto", "expanded", "rail", "hidden"]);
+        assert!(w[1] > w[2] + 10.0);
     }
 
     #[test]
@@ -230,6 +349,7 @@ mod tests {
             Widget::Choice {
                 options: &["2", "4", "8"],
                 index: 1,
+                hover: None,
             },
         ];
         for w in widgets {

@@ -27,6 +27,14 @@ pub struct Palette {
     pub border: Color,
     pub pill_active: Color,
     pub pill_hover: Color,
+    /// Fill of the *selected* segment in a choice row. Deliberately stronger
+    /// than `pill_active`: the selected option must be obvious at a glance,
+    /// especially in the light theme (issue #6.4).
+    pub pill_selected: Color,
+    /// 1 px hairline around the selected segment, to lift it off the panel.
+    pub pill_selected_border: Color,
+    /// Text inside the selected segment: full contrast, never muted.
+    pub pill_selected_text: Color,
     pub text: Color,
     pub muted: Color,
     pub accent: Color,
@@ -57,6 +65,9 @@ pub const DARK: Palette = Palette {
     border: rgb(0x262a31),
     pill_active: rgb(0x2b303a),
     pill_hover: rgb(0x20242b),
+    pill_selected: rgb(0x3a4150),
+    pill_selected_border: rgb(0x4d5768),
+    pill_selected_text: rgb(0xf4f6f9),
     text: rgb(0xe6e8ec),
     muted: rgb(0x8a909c),
     accent: rgb(0xf0a030),
@@ -86,6 +97,11 @@ pub const LIGHT: Palette = Palette {
     border: rgb(0xd3d7de),
     pill_active: rgb(0xdadfe8),
     pill_hover: rgb(0xe3e6ec),
+    // A crisp white card with a hairline and near-black text. The old light
+    // grey pill with muted text was hard to read (issue #6.4).
+    pill_selected: rgb(0xffffff),
+    pill_selected_border: rgb(0xb9c0cc),
+    pill_selected_text: rgb(0x1a1d23),
     text: rgb(0x1f2329),
     muted: rgb(0x6b7280),
     accent: rgb(0xc9781a),
@@ -160,6 +176,30 @@ mod tests {
         // Dark text must be brighter than its background, light the reverse.
         const { assert!(DARK.text[0] > DARK.bg[0]) };
         const { assert!(LIGHT.text[0] < LIGHT.bg[0]) };
+    }
+
+    #[test]
+    fn selected_segments_stay_high_contrast_in_both_themes() {
+        for (name, p) in [("dark", DARK), ("light", LIGHT)] {
+            // The selected fill must differ from the panel background, or the
+            // pill disappears (issue #6.4).
+            let d =
+                |a: Color, b: Color| -> f32 { (0..3).map(|i| (a[i] - b[i]).abs()).sum::<f32>() };
+            assert!(d(p.pill_selected, p.bg) > 0.05, "{name}: pill vs bg");
+            assert!(
+                d(p.pill_selected, p.pill_hover) > 0.05,
+                "{name}: pill vs hover"
+            );
+            // Its text must contrast strongly with the fill it sits on.
+            let lum = |c: Color| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+            let (a, b) = (lum(p.pill_selected_text), lum(p.pill_selected));
+            assert!((a - b).abs() > 0.5, "{name}: selected text contrast");
+            // And the border must be visible against the fill.
+            assert!(
+                d(p.pill_selected_border, p.pill_selected) > 0.05,
+                "{name}: border"
+            );
+        }
     }
 
     #[test]

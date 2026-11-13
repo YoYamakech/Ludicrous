@@ -155,6 +155,8 @@ pub fn draw(
     update: &UpdateInfo,
     selected: usize,
     hover: Option<usize>,
+    // Which option of the hovered row's choice control is under the pointer.
+    hover_seg: Option<usize>,
 ) -> Geometry {
     let geo = Geometry::new(l);
 
@@ -170,7 +172,10 @@ pub fn draw(
     for (i, row) in Row::ALL.iter().enumerate() {
         let y = geo.row_y(i);
         let focused = i == selected;
-        let widget = widget_for(*row, cfg, update);
+        // Which segment is under the pointer, for the per-segment hover wash.
+        let hovered = hover == Some(i) && !focused;
+        let seg = if hovered { hover_seg } else { None };
+        let widget = widget_for(*row, cfg, update, seg);
         let label = match *row {
             // The updater row explains itself: what is available, or what
             // `Check now` will do. The action button carries the verb.
@@ -184,16 +189,9 @@ pub fn draw(
         if i > 0 {
             r.rect(geo.x, y - 1.0, geo.w, 1.0, p.border);
         }
-        widgets::draw_row(r, p, y, geo.x, geo.w, label, &widget, focused);
-
-        // Hover highlight on the control part only.
-        if hover == Some(i) && !focused {
-            let cx = geo.x + geo.w - CONTROL_W;
-            r.rounded_rect(cx - 2.0, y + 6.0, CONTROL_W + 4.0, 28.0, 4.0, {
-                // A very light wash: the palette's hover colour, no alpha maths.
-                p.pill_hover
-            });
-        }
+        // The hover wash is drawn by `draw_row`, behind the control, so it can
+        // never cover a label (issue #6.3).
+        widgets::draw_row(r, p, y, geo.x, geo.w, label, &widget, focused, hovered);
     }
 
     // Privacy note (v1.2 section 9): say exactly what leaves the machine,
@@ -245,7 +243,7 @@ pub fn register(map: &mut HitMap, l: &Layout, cfg: &Config, update: &UpdateInfo)
     let geom = widgets::RowGeom { control_x };
     for i in 0..Row::COUNT {
         let row = Row::from_index(i);
-        let widget = widget_for(row, cfg, update);
+        let widget = widget_for(row, cfg, update, None);
         let y = geo.row_y(i);
         for (x, w, part) in geom.spans(&widget) {
             map.push(
@@ -283,7 +281,12 @@ impl Default for UpdateInfo {
     }
 }
 
-pub fn widget_for<'a>(row: Row, cfg: &Config, update: &'a UpdateInfo) -> Widget<'a> {
+pub fn widget_for<'a>(
+    row: Row,
+    cfg: &Config,
+    update: &'a UpdateInfo,
+    hover: Option<usize>,
+) -> Widget<'a> {
     // Without the updater there is no row to build from it, but the signature
     // stays the same so the callers do not need a feature check.
     #[cfg(not(feature = "updater"))]
@@ -296,6 +299,7 @@ pub fn widget_for<'a>(row: Row, cfg: &Config, update: &'a UpdateInfo) -> Widget<
                 .iter()
                 .position(|w| *w == cfg.tab_width)
                 .unwrap_or(1),
+            hover,
         },
         Row::LineNumbers => Widget::Toggle(cfg.show_line_numbers),
         Row::CursorBlink => Widget::Toggle(cfg.cursor_blink),
@@ -305,6 +309,7 @@ pub fn widget_for<'a>(row: Row, cfg: &Config, update: &'a UpdateInfo) -> Widget<
                 Buttons::Left => 0,
                 Buttons::Right => 1,
             },
+            hover,
         },
         Row::CornerRadius => Widget::Choice {
             options: &RADIUS_LABELS,
@@ -312,6 +317,7 @@ pub fn widget_for<'a>(row: Row, cfg: &Config, update: &'a UpdateInfo) -> Widget<
                 .iter()
                 .position(|w| *w == cfg.corner_radius)
                 .unwrap_or(2),
+            hover,
         },
         Row::Sidebar => Widget::Choice {
             options: &SIDEBAR_LABELS,
@@ -321,6 +327,7 @@ pub fn widget_for<'a>(row: Row, cfg: &Config, update: &'a UpdateInfo) -> Widget<
                 SidebarMode::Rail => 2,
                 SidebarMode::Hidden => 3,
             },
+            hover,
         },
         Row::Theme => Widget::Choice {
             options: &THEME_LABELS,
@@ -328,6 +335,7 @@ pub fn widget_for<'a>(row: Row, cfg: &Config, update: &'a UpdateInfo) -> Widget<
                 Theme::Dark => 0,
                 Theme::Light => 1,
             },
+            hover,
         },
         Row::Animations => Widget::Toggle(cfg.animations),
         #[cfg(feature = "updater")]
@@ -468,7 +476,7 @@ pub fn apply_part(cfg: &mut Config, row: Row, part: Option<usize>) -> bool {
     let Some(part) = part else {
         return false;
     };
-    match widget_for(row, cfg, &UpdateInfo::default()) {
+    match widget_for(row, cfg, &UpdateInfo::default(), None) {
         Widget::Toggle(_) => step(cfg, row, 1),
         // An action is not a value: the app decides what clicking it means.
         Widget::Action { .. } => false,
@@ -489,15 +497,15 @@ mod tests {
     fn the_spec_defaults_are_reachable_from_the_rows() {
         let cfg = Config::default();
         assert!(matches!(
-            widget_for(Row::FontSize, &cfg, &UpdateInfo::default()),
+            widget_for(Row::FontSize, &cfg, &UpdateInfo::default(), None),
             Widget::Stepper("15")
         ));
         assert!(matches!(
-            widget_for(Row::LineNumbers, &cfg, &UpdateInfo::default()),
+            widget_for(Row::LineNumbers, &cfg, &UpdateInfo::default(), None),
             Widget::Toggle(true)
         ));
         assert!(matches!(
-            widget_for(Row::CursorBlink, &cfg, &UpdateInfo::default()),
+            widget_for(Row::CursorBlink, &cfg, &UpdateInfo::default(), None),
             Widget::Toggle(false)
         ));
     }
@@ -599,7 +607,7 @@ mod tests {
                 action: action.to_string(),
                 enabled,
             };
-            match widget_for(Row::UpdateAction, &cfg, &info) {
+            match widget_for(Row::UpdateAction, &cfg, &info, None) {
                 Widget::Action { label, enabled: e } => {
                     assert_eq!(label, action);
                     assert_eq!(e, enabled);
@@ -614,7 +622,7 @@ mod tests {
             enabled: false,
         };
         let geom = widgets::RowGeom { control_x: 0.0 };
-        let spans = geom.spans(&widget_for(Row::UpdateAction, &cfg, &info));
+        let spans = geom.spans(&widget_for(Row::UpdateAction, &cfg, &info, None));
         assert_eq!(spans.len(), 1, "one piece, so the cursor is a hand");
     }
 
@@ -633,7 +641,7 @@ mod tests {
         for row in Row::ALL {
             let mut cfg = Config::default();
             // Toggles and steppers change with a step; choices with a choice.
-            let changed = match widget_for(row, &cfg, &UpdateInfo::default()) {
+            let changed = match widget_for(row, &cfg, &UpdateInfo::default(), None) {
                 Widget::Choice { .. } => choose(&mut cfg, row, 0) || choose(&mut cfg, row, 1),
                 Widget::Action { .. } => continue, // not a value row
                 _ => step(&mut cfg, row, 1) || step(&mut cfg, row, -1),

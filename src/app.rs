@@ -145,6 +145,9 @@ pub struct App {
     settings_row: usize,
     /// Settings row under the mouse (for the hover wash).
     settings_hover: Option<usize>,
+    /// The hovered settings control's option under the pointer: for a choice
+    /// row, which segment gets the faint wash (issue #6.3).
+    settings_hover_seg: Option<usize>,
     /// Window geometry to restore at startup and write back on exit.
     state: WindowState,
     /// Cursor blink phase (only used when `config.cursor_blink` is on).
@@ -220,6 +223,7 @@ impl App {
             settings_open: false,
             settings_row: 0,
             settings_hover: None,
+            settings_hover_seg: None,
             state: WindowState::default(),
             blink_on: true,
             blink_at: std::time::Instant::now(),
@@ -831,6 +835,19 @@ impl App {
         let (x, y) = window::to_points(pos, scale);
         let l = self.settings_geometry()?;
         settings::Geometry::new(&l).row_at(x, y)
+    }
+
+    /// Which option of the hovered choice row is under the pointer. Read from
+    /// the hit map, so it is exactly the piece a click would hit.
+    fn settings_segment_at_cursor(&self) -> Option<usize> {
+        let pos = self.cursor_pos?;
+        let window = self.window.as_ref()?;
+        let scale = window.scale_factor() as f32;
+        let (x, y) = window::to_points(pos, scale);
+        match self.hitmap.target_at((x, y)) {
+            Some(Target::SettingsRow { part, .. }) => part,
+            _ => None,
+        }
     }
 
     /// Apply one click on a settings control piece. Returns true when the row
@@ -1450,8 +1467,19 @@ impl App {
         view::draw(r, ws, &layout, &chrome);
         // The settings page replaces the text area, over the editor layer.
         if self.settings_open {
+            // The settings body starts *below* the title bar and is clipped
+            // to that band: content may never bleed up over the title or its
+            // buttons (issue #6.7).
             r.layer(crate::render::Layer::Overlay);
-            r.rect(layout.sidebar_w, 0.0, w - layout.sidebar_w, h, palette.bg);
+            let body_y = layout.title_h;
+            r.push_clip(layout.sidebar_w, body_y, w - layout.sidebar_w, h - body_y);
+            r.rect(
+                layout.sidebar_w,
+                body_y,
+                w - layout.sidebar_w,
+                h - body_y,
+                palette.bg,
+            );
             #[cfg(feature = "updater")]
             let update_info = &settings_update_info;
             #[cfg(not(feature = "updater"))]
@@ -1463,6 +1491,7 @@ impl App {
                 &self.config,
                 update_info,
                 self.settings_row,
+                self.settings_hover_seg,
                 self.settings_hover,
             );
         }
@@ -2012,6 +2041,7 @@ impl ApplicationHandler<UserEvent> for App {
                     let row = self.settings_row_at_cursor();
                     if row != self.settings_hover {
                         self.settings_hover = row;
+                        self.settings_hover_seg = self.settings_segment_at_cursor();
                         if let Some(w) = self.window.as_ref() {
                             w.request_redraw();
                         }
