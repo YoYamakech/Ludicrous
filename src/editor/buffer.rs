@@ -22,6 +22,13 @@ pub struct Buffer {
     pub path: Option<PathBuf>,
     pub modified: bool,
     pub line_ending: LineEnding,
+    /// Bumped on every text change. The highlighter caches spans per version,
+    /// so a redraw that changes nothing never re-parses (v1.2 section 6).
+    pub version: u64,
+    /// The most recent change, in character indexes: `(start, removed, added)`.
+    /// `Editor::apply` turns this into a tree-sitter `InputEdit` without having
+    /// to know which command produced it. `None` until the first edit.
+    pub last_edit: Option<(usize, usize, usize)>,
 }
 
 impl Buffer {
@@ -31,6 +38,8 @@ impl Buffer {
             path: None,
             modified: false,
             line_ending: LineEnding::Lf,
+            version: 1,
+            last_edit: None,
         }
     }
 
@@ -62,6 +71,8 @@ impl Buffer {
             path: Some(path.to_path_buf()),
             modified: false,
             line_ending,
+            version: 1,
+            last_edit: None,
         })
     }
 
@@ -122,22 +133,32 @@ impl Buffer {
         (line, i - self.rope.line_to_char(line))
     }
 
+    /// Record that a change happened, for the highlighter. Every mutation goes
+    /// through one of the methods below, so this is the only place that has to
+    /// remember to bump the version.
+    fn changed(&mut self, start: usize, removed: usize, added: usize) {
+        self.modified = true;
+        self.version = self.version.wrapping_add(1);
+        self.last_edit = Some((start, removed, added));
+    }
+
     /// Insert a whole string at a character index (used by undo/redo).
     pub fn insert_str_at(&mut self, i: usize, text: &str) {
+        let added = text.chars().count();
         self.rope.insert(i, text);
-        self.modified = true;
+        self.changed(i, 0, added);
     }
 
     /// Remove `len` characters starting at a character index.
     pub fn remove_at(&mut self, i: usize, len: usize) {
         self.rope.remove(i..i + len);
-        self.modified = true;
+        self.changed(i, len, 0);
     }
 
     pub fn insert_char(&mut self, line: usize, col: usize, ch: char) {
         let i = self.index(line, col);
         self.rope.insert_char(i, ch);
-        self.modified = true;
+        self.changed(i, 0, 1);
     }
 
     /// Split the line at the cursor. Returns the new cursor position.
@@ -147,7 +168,7 @@ impl Buffer {
     pub fn insert_newline(&mut self, line: usize, col: usize) -> (usize, usize) {
         let i = self.index(line, col);
         self.rope.insert_char(i, '\n');
-        self.modified = true;
+        self.changed(i, 0, 1);
         (line + 1, 0)
     }
 
@@ -156,13 +177,13 @@ impl Buffer {
         if col > 0 {
             let i = self.index(line, col);
             self.rope.remove(i - 1..i);
-            self.modified = true;
+            self.changed(i - 1, 1, 0);
             (line, col - 1)
         } else if line > 0 {
             let prev_len = self.line_len(line - 1);
             let i = self.index(line, 0);
             self.rope.remove(i - 1..i);
-            self.modified = true;
+            self.changed(i - 1, 1, 0);
             (line - 1, prev_len)
         } else {
             (line, col)
@@ -176,7 +197,7 @@ impl Buffer {
         if col < self.line_len(line) || line + 1 < self.line_count() {
             let i = self.index(line, col);
             self.rope.remove(i..i + 1);
-            self.modified = true;
+            self.changed(i, 1, 0);
         }
         (line, col)
     }
@@ -239,6 +260,8 @@ mod tests {
             path: None,
             modified: false,
             line_ending: LineEnding::Lf,
+            version: 1,
+            last_edit: None,
         }
     }
 
@@ -396,6 +419,8 @@ mod tests {
             path: Some(path.clone()),
             modified: true,
             line_ending: LineEnding::Lf,
+            version: 1,
+            last_edit: None,
         };
         assert!(b.save().is_err());
         assert!(b.modified);

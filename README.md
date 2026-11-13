@@ -12,6 +12,8 @@ OpenGL 3.3 renderer. No Electron, no wgpu, no Vulkan.
 - Redraws only when something changes (`ControlFlow::Wait`); the caret blinks with
   `WaitUntil`, never a busy loop
 - A hand-drawn shell: rounded window, its own title bar, sidebar, settings page
+- Syntax highlighting for Rust, C, C++, Python, JSON, TOML and Markdown
+  (tree-sitter, only the visible lines are queried)
 - Animated sidebar, smooth scrolling and hover fades, switchable off in
   Settings; idle CPU stays at 0% (3–4% with cursor blink on)
 - File-type icons from a 5 KB Nerd Font subset; native file dialogs and

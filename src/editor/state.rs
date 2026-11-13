@@ -51,6 +51,13 @@ pub struct Editor {
     pub anchor: Option<Cursor>,
     /// Spaces per indent level (the `tab_width` setting).
     indent: usize,
+    /// Syntax highlighting for this buffer, built the first time it is needed
+    /// (never at startup). `None` means "no colours": unnamed buffer, unknown
+    /// extension, too large, or the `syntax` feature is off.
+    pub highlight: Option<crate::editor::highlight::Highlighter>,
+    /// True once we have tried to build a highlighter, so a failed attempt does
+    /// not repeat on every frame.
+    highlight_tried: bool,
 }
 
 impl Editor {
@@ -67,7 +74,49 @@ impl Editor {
             history: History::new(),
             anchor: None,
             indent: INDENT_WIDTH,
+            highlight: None,
+            highlight_tried: false,
         }
+    }
+
+    /// Build the highlighter on first use, from the buffer's path.
+    ///
+    /// Lazy on purpose (v1.2 section 6): opening a `.txt` or starting with an
+    /// empty buffer costs nothing, and a file over the size cap never parses.
+    #[cfg(feature = "syntax")]
+    pub fn ensure_highlighter(&mut self) {
+        if self.highlight_tried {
+            return;
+        }
+        self.highlight_tried = true;
+        let Some(lang) = crate::editor::highlight::lang_for_buffer(&self.buffer) else {
+            return;
+        };
+        self.highlight = crate::editor::highlight::Highlighter::new(lang);
+    }
+
+    /// Feature off: the stub has no `Highlighter`, so there is nothing to build.
+    #[cfg(not(feature = "syntax"))]
+    pub fn ensure_highlighter(&mut self) {
+        self.highlight_tried = true;
+    }
+
+    /// True when this file is too large to highlight. The status bar says so
+    /// rather than leaving the user wondering why there are no colours.
+    #[cfg(feature = "syntax")]
+    pub fn highlighting_off_reason(&self) -> Option<&'static str> {
+        let path = self.buffer.path.as_ref()?;
+        if self.buffer.rope.len_bytes() > crate::editor::highlight::MAX_HIGHLIGHT_BYTES {
+            return Some("Highlighting off (large file)");
+        }
+        // No language for this extension is normal, not a warning.
+        crate::editor::highlight::Lang::for_path(path)?;
+        None
+    }
+
+    #[cfg(not(feature = "syntax"))]
+    pub fn highlighting_off_reason(&self) -> Option<&'static str> {
+        None
     }
 
     /// Set how many spaces one indent level is. Tab, Shift+Tab, auto-indent
@@ -297,6 +346,45 @@ impl Editor {
     }
 
     pub fn apply(&mut self, cmd: Command) -> Control {
+        // Every text change goes through here (v1.2 section 2), which is why the
+        // syntax tree is updated here too: one place, before and after, and the
+        // highlighter never has to know which command ran.
+        let control = self.apply_inner(cmd);
+        self.sync_highlight_edit();
+        control
+    }
+
+    /// Hand the buffer's last change to the highlighter as a tree edit.
+    ///
+    /// The buffer records `(start, removed, added)` in characters; the
+    /// conversion to bytes and points lives in `highlight::Edit`, which has its
+    /// own multi-byte tests.
+    fn sync_highlight_edit(&mut self) {
+        #[cfg(feature = "syntax")]
+        {
+            let Some((start, removed, added)) = self.buffer.last_edit.take() else {
+                return;
+            };
+            self.ensure_highlighter();
+            if let Some(h) = self.highlight.as_mut() {
+                let edit = crate::editor::highlight::Edit {
+                    start_char: start,
+                    old_chars: removed,
+                    new_chars: added,
+                };
+                if let Some(ie) = edit.input_edit(&self.buffer) {
+                    h.edit(&ie);
+                }
+            }
+        }
+        #[cfg(not(feature = "syntax"))]
+        {
+            // Nothing to keep in sync; clear the record so it cannot grow stale.
+            self.buffer.last_edit = None;
+        }
+    }
+
+    fn apply_inner(&mut self, cmd: Command) -> Control {
         // A status message only describes the command that produced it, so any
         // new command clears it first. Any key other than Ctrl+Q also cancels a
         // pending quit warning.
@@ -606,6 +694,8 @@ mod tests {
             path: None,
             modified: false,
             line_ending: crate::editor::buffer::LineEnding::Lf,
+            version: 1,
+            last_edit: None,
         })
     }
 

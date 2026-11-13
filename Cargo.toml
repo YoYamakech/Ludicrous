@@ -16,6 +16,17 @@ arboard = { version = "3.6.1", default-features = false }
 # portal traffic until a dialog is actually opened. `rfd` 0.18 defaults to
 # [xdg-portal, wayland]; we keep only the portal, which talks over D-Bus.
 rfd = { version = "0.18", default-features = false, features = ["xdg-portal"], optional = true }
+# Syntax highlighting. Pinned exactly: the grammar crates and the core crate
+# must agree on the Language API, and this set is the one that compiles against
+# tree-sitter 0.27 (checked by hand before pinning).
+tree-sitter = { version = "0.27.2", optional = true }
+tree-sitter-rust = { version = "0.24.2", optional = true }
+tree-sitter-c = { version = "0.24.2", optional = true }
+tree-sitter-cpp = { version = "0.23.4", optional = true }
+tree-sitter-python = { version = "0.25.0", optional = true }
+tree-sitter-json = { version = "0.24.8", optional = true }
+tree-sitter-toml-ng = { version = "0.7.0", optional = true }
+tree-sitter-md = { version = "0.5.4", optional = true }
 
 # Heavy, optional features. All on by default, so a plain `cargo build` is the
 # full editor; turn them off for a fast edit/compile loop on the old laptop:
@@ -27,7 +38,17 @@ rfd = { version = "0.18", default-features = false, features = ["xdg-portal"], o
 # real switch that the code can test with `cfg!(feature = "...")`.
 [features]
 default = ["syntax", "lsp", "updater", "dialogs"]
-syntax = []
+# Each grammar compiles a C parser at build time; that is the cost of the feature.
+syntax = [
+    "dep:tree-sitter",
+    "dep:tree-sitter-rust",
+    "dep:tree-sitter-c",
+    "dep:tree-sitter-cpp",
+    "dep:tree-sitter-python",
+    "dep:tree-sitter-json",
+    "dep:tree-sitter-toml-ng",
+    "dep:tree-sitter-md",
+]
 lsp = []
 updater = []
 dialogs = ["dep:rfd"]

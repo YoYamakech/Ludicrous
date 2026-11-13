@@ -487,6 +487,8 @@ mod tests {
             path: None,
             modified: false,
             line_ending: crate::editor::buffer::LineEnding::Lf,
+            version: 1,
+            last_edit: None,
         });
         assert_eq!(buffer_name(&ed), "[No Name]");
     }

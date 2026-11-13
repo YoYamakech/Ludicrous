@@ -55,6 +55,16 @@ pub enum UserEvent {
         crate::workspace::DialogKind,
         Option<Vec<std::path::PathBuf>>,
     ),
+    /// A background syntax parse finished for `buffer` at `version`.
+    ///
+    /// The tree is boxed because it is large and this enum is moved around;
+    /// `Tree` is `Send` (checked), which is what makes the thread possible.
+    #[cfg(feature = "syntax")]
+    ParseDone {
+        buffer: usize,
+        version: u64,
+        tree: Option<Box<tree_sitter::Tree>>,
+    },
 }
 
 /// The notifier handed to background modules. `ui/` and `workspace/` never see
@@ -778,6 +788,87 @@ impl App {
         });
     }
 
+    /// Install a finished background parse and redraw once.
+    ///
+    /// The reply carries the buffer index it was started for. If that buffer has
+    /// been closed, or the text changed while parsing, the tree is dropped:
+    /// a stale tree would highlight the wrong text.
+    #[cfg(feature = "syntax")]
+    fn parse_done(&mut self, buffer: usize, version: u64, tree: Option<Box<tree_sitter::Tree>>) {
+        let Some(ws) = self.workspace.as_mut() else {
+            return;
+        };
+        let Some(ed) = ws.buffers.get_mut(buffer) else {
+            return; // closed while parsing
+        };
+        let current = ed.buffer.version;
+        let Some(h) = ed.highlight.as_mut() else {
+            return;
+        };
+        let installed = h.finish_async(version, tree.map(|t| *t), current);
+        if self.anim_debug {
+            eprintln!("parse done buffer={buffer} version={version} current={current} installed={installed}");
+        }
+        // Whether it was installed or turned out stale, one redraw settles it:
+        // a stale result made the highlighter re-request a parse next frame.
+        if let Some(w) = self.window.as_ref() {
+            w.request_redraw();
+        }
+        let _ = installed;
+    }
+
+    /// Start a background parse when the active buffer is large.
+    ///
+    /// Small files parse inline: a few hundred microseconds is cheaper than the
+    /// thread hand-off. Called once per frame; the highlighter ignores the call
+    /// while a parse for the same version is already in flight.
+    #[cfg(feature = "syntax")]
+    fn start_async_parse_if_needed(&mut self) {
+        let Some(index) = self.workspace.as_ref().map(|ws| ws.active) else {
+            return;
+        };
+        // Build the highlighter before asking whether the file is big: the
+        // first frame of a big file must reach this before any parse decision.
+        if let Some(ed) = self
+            .workspace
+            .as_mut()
+            .and_then(|ws| ws.buffers.get_mut(index))
+        {
+            ed.ensure_highlighter();
+        }
+        self.maybe_parse_async(index);
+    }
+
+    #[cfg(feature = "syntax")]
+    fn maybe_parse_async(&mut self, buffer_index: usize) {
+        let Some(proxy) = Some(self.proxy.clone()) else {
+            return;
+        };
+        let Some(ws) = self.workspace.as_mut() else {
+            return;
+        };
+        let Some(ed) = ws.buffers.get_mut(buffer_index) else {
+            return;
+        };
+        let version = ed.buffer.version;
+        let Some(h) = ed.highlight.as_mut() else {
+            return;
+        };
+        if !h.wants_async(&ed.buffer) {
+            return; // small: the normal path parses inline
+        }
+        let started = h.reparse_async(&ed.buffer, version, move |version, tree| {
+            // Dev aid: proves the parse ran off the UI thread.
+            // A closed loop or a full queue must not panic a worker thread.
+            let _ = proxy.send_event(UserEvent::ParseDone {
+                buffer: buffer_index,
+                version,
+                tree: tree.map(Box::new),
+            });
+        });
+        let _ = started;
+    }
+
     /// Apply a dialog result. `None` means the dialog could not be shown.
     fn dialog_result(&mut self, kind: crate::workspace::DialogKind, paths: Option<Vec<PathBuf>>) {
         if !self.dialogs.finish(kind) {
@@ -1155,6 +1246,11 @@ impl App {
         // Read before the GL state is borrowed mutably (it borrows `self`).
         let animating = self.animating();
         let scroll_pos = self.anims.value(crate::ui::anim::Which::Scroll);
+        // A big file parses on a thread; until it lands the editor draws plain
+        // text, so the frame that opens it is never blocked (v1.2 section 6).
+        // This runs before the GL borrows below, because it takes `self`.
+        #[cfg(feature = "syntax")]
+        self.start_async_parse_if_needed();
         let (Some(window), Some(gl), Some(ws)) = (
             self.window.as_ref(),
             self.gl.as_mut(),
@@ -1185,7 +1281,30 @@ impl App {
         let (rows, cols) = (layout.rows, layout.cols);
         if let Some(ed) = ws.active_editor_mut() {
             ed.ensure_visible(rows, cols);
+            ed.ensure_highlighter();
         }
+        // Highlight only the visible lines. The highlighter caches by version
+        // and range, so a blink or a hover redraw reuses these spans.
+        let span_first = ws.active_editor().map(|e| e.scroll).unwrap_or(0);
+        let spans = match ws.active_editor_mut() {
+            Some(ed) => {
+                let last = span_first + rows + 2;
+                let version = ed.buffer.version;
+                let t0 = std::time::Instant::now();
+                let spans = match ed.highlight.as_mut() {
+                    Some(h) => h.spans_for_lines(&ed.buffer, span_first, last, version),
+                    None => Vec::new(),
+                };
+                if self.anim_debug {
+                    eprintln!(
+                        "spans {:.2} ms (version {version})",
+                        t0.elapsed().as_secs_f32() * 1000.0
+                    );
+                }
+                spans
+            }
+            None => Vec::new(),
+        };
         // Keep the animation chasing the editor's own (clamped) scroll. This is
         // a direct field access so it does not conflict with the `ws` borrow.
         let scroll_now = ws.active_editor().map(|e| e.scroll as f32).unwrap_or(0.0);
@@ -1204,6 +1323,8 @@ impl App {
             caret: self.blink_on || !self.config.cursor_blink,
             drop_hover: self.drop_hover,
             scroll_lines,
+            spans: &spans,
+            span_first,
             sidebar: self.sidebar.clone(),
             palette,
             settings: self.settings_open,
@@ -1383,6 +1504,12 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::DialogResult(kind, paths) => self.dialog_result(kind, paths),
+            #[cfg(feature = "syntax")]
+            UserEvent::ParseDone {
+                buffer,
+                version,
+                tree,
+            } => self.parse_done(buffer, version, tree),
         }
     }
 

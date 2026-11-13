@@ -36,6 +36,19 @@ pub struct Palette {
     pub status_text: Color,
     pub selection: Color,
     pub close_hover: Color,
+    /// Syntax colours. One per `TokenKind`, so the editor picks by kind and
+    /// never by string. Tuned to stay legible on both backgrounds.
+    pub syn_keyword: Color,
+    pub syn_string: Color,
+    pub syn_comment: Color,
+    pub syn_function: Color,
+    pub syn_type: Color,
+    pub syn_number: Color,
+    pub syn_constant: Color,
+    pub syn_property: Color,
+    pub syn_operator: Color,
+    pub syn_punctuation: Color,
+    pub syn_heading: Color,
 }
 
 pub const DARK: Palette = Palette {
@@ -53,6 +66,18 @@ pub const DARK: Palette = Palette {
     status_text: rgb(0xb8bec8),
     selection: rgb(0x33475f),
     close_hover: rgb(0xd94f4f),
+    // Dark syntax colours: soft on the eyes, distinct at 8 px tall glyphs.
+    syn_keyword: rgb(0xc792ea),
+    syn_string: rgb(0x9ece6a),
+    syn_comment: rgb(0x6b7280),
+    syn_function: rgb(0x7aa2f7),
+    syn_type: rgb(0x2ac3de),
+    syn_number: rgb(0xff9e64),
+    syn_constant: rgb(0xe0af68),
+    syn_property: rgb(0x73daca),
+    syn_operator: rgb(0x89ddff),
+    syn_punctuation: rgb(0x9aa5b1),
+    syn_heading: rgb(0xf0a030),
 };
 
 pub const LIGHT: Palette = Palette {
@@ -70,6 +95,18 @@ pub const LIGHT: Palette = Palette {
     status_text: rgb(0x414b59),
     selection: rgb(0xbfd3e8),
     close_hover: rgb(0xd94f4f),
+    // Light syntax colours: darker versions of the same hues.
+    syn_keyword: rgb(0x8a3fb0),
+    syn_string: rgb(0x3e7d1f),
+    syn_comment: rgb(0x8a909c),
+    syn_function: rgb(0x1d5fb8),
+    syn_type: rgb(0x0b7285),
+    syn_number: rgb(0xb45309),
+    syn_constant: rgb(0x8a5a00),
+    syn_property: rgb(0x0f766e),
+    syn_operator: rgb(0x0e7490),
+    syn_punctuation: rgb(0x6b7280),
+    syn_heading: rgb(0xc9781a),
 };
 
 impl Palette {
@@ -77,6 +114,27 @@ impl Palette {
         match theme {
             Theme::Dark => DARK,
             Theme::Light => LIGHT,
+        }
+    }
+
+    /// The colour for a highlighted token. `Unknown` means "no special colour",
+    /// which is the normal text colour: an unrecognised capture must never make
+    /// text invisible.
+    pub fn syntax(&self, kind: crate::editor::highlight::TokenKind) -> Color {
+        use crate::editor::highlight::TokenKind as K;
+        match kind {
+            K::Unknown | K::Variable => self.text,
+            K::Keyword => self.syn_keyword,
+            K::String => self.syn_string,
+            K::Comment => self.syn_comment,
+            K::Function => self.syn_function,
+            K::Type => self.syn_type,
+            K::Number => self.syn_number,
+            K::Constant => self.syn_constant,
+            K::Property => self.syn_property,
+            K::Operator => self.syn_operator,
+            K::Punctuation => self.syn_punctuation,
+            K::Heading => self.syn_heading,
         }
     }
 }

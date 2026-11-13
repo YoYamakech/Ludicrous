@@ -2,6 +2,7 @@
 // Drawing is stateless: everything is recomputed each frame from `Editor`
 // plus the geometry in `Layout`. Only visible lines are touched.
 
+use crate::editor::highlight::{Span, TokenKind};
 use crate::editor::Editor;
 use crate::render::{Icon, Renderer};
 use crate::ui::focus::Focus;
@@ -36,6 +37,12 @@ pub struct Chrome<'a> {
     pub buttons_left: bool,
     /// False during the dark half of a blinking cursor.
     pub caret: bool,
+    /// Highlight spans for the visible lines, one vec per line starting at the
+    /// first drawn line. Empty means "plain text": no highlighting, off, or a
+    /// large file.
+    pub spans: &'a [Vec<Span>],
+    /// Line index the first `spans` entry belongs to.
+    pub span_first: usize,
     /// Vertical scroll in (fractional) lines. Whole numbers when animations are
     /// off; in between while a scroll is easing. Glyphs are always placed on
     /// whole pixels, so the text never blurs.
@@ -64,7 +71,7 @@ pub fn draw(r: &mut Renderer, ws: &Workspace, l: &Layout, chrome: &Chrome) {
         sidebar::draw(r, ws, l, &geo, &chrome.sidebar, chrome.focus, p);
     }
     if !chrome.settings {
-        draw_editor(r, ed, l, p, chrome.caret, chrome.scroll_lines);
+        draw_editor(r, ed, l, p, chrome);
     }
     draw_status_bar(r, ed, l, p);
 
@@ -173,14 +180,9 @@ fn draw_title_bar(r: &mut Renderer, l: &Layout, chrome: &Chrome) {
     }
 }
 
-fn draw_editor(
-    r: &mut Renderer,
-    ed: &Editor,
-    l: &Layout,
-    p: &Palette,
-    caret: bool,
-    scroll_lines: f32,
-) {
+fn draw_editor(r: &mut Renderer, ed: &Editor, l: &Layout, p: &Palette, chrome: &Chrome) {
+    let caret = chrome.caret;
+    let scroll_lines = chrome.scroll_lines;
     let body_top = l.title_h;
     let body_h = l.height - l.status_h - body_top;
 
@@ -240,8 +242,21 @@ fn draw_editor(
         }
         // Only the visible columns are laid out: a 100,000-character line
         // costs the same as a short one.
-        let visible = visible_slice(&line, ed.scroll_x, l.cols);
-        r.text(l.text_x, y, visible, p.text);
+        let spans = chrome
+            .spans
+            .get(idx.wrapping_sub(chrome.span_first))
+            .filter(|s| !s.is_empty());
+        match spans {
+            // Highlighted: draw one run per colour. All runs share the glyph
+            // batch, so this is more bytes, not more draw calls.
+            Some(spans) => draw_runs(r, &line, spans, ed.scroll_x, l, y, p),
+            // Plain text: the same single call as before, which is why a file
+            // with no language (or highlighting off) costs nothing extra.
+            None => {
+                let visible = visible_slice(&line, ed.scroll_x, l.cols);
+                r.text(l.text_x, y, visible, p.text);
+            }
+        }
     }
 
     // Cursor: a thin vertical bar at the character cell under the cursor.
@@ -288,6 +303,10 @@ fn draw_status_bar(r: &mut Renderer, ed: &Editor, l: &Layout, p: &Palette) {
         r.text_ui(mx, text_y, msg, p.close_hover);
     } else if ed.is_dirty() {
         r.text_ui(mx, text_y, "[modified]", p.accent);
+    } else if let Some(reason) = ed.highlighting_off_reason() {
+        // v1.2 section 6: say why there are no colours instead of leaving the
+        // user guessing. Muted, because it is information, not a problem.
+        r.text_ui(mx, text_y, reason, p.muted);
     }
 
     let pos = format!("Ln {}, Col {}", ed.cursor.line + 1, ed.cursor.col + 1);
@@ -297,6 +316,74 @@ fn draw_status_bar(r: &mut Renderer, ed: &Editor, l: &Layout, p: &Palette) {
 
 /// The part of `line` that is visible when scrolled `scroll_x` columns right.
 /// Returns a slice of the original string, so no allocation per line.
+/// Draw one line as coloured runs.
+///
+/// Spans can overlap (a function name inside a call expression) and later spans
+/// win, so the line is walked once from the left, taking whichever span is
+/// active at each character. Bytes are not tracked separately: the slice is
+/// made by character index, which is what the spans carry.
+fn draw_runs(
+    r: &mut Renderer,
+    line: &str,
+    spans: &[Span],
+    scroll_x: usize,
+    l: &Layout,
+    y: f32,
+    p: &Palette,
+) {
+    let chars: Vec<char> = line.chars().skip(scroll_x).take(l.cols).collect();
+    if chars.is_empty() {
+        return;
+    }
+    let base = scroll_x as u32;
+    // Start positions are sorted; a span covers `[start, end)` in line columns.
+    let mut active: Option<(u32, TokenKind)> = None;
+    let mut run_start = 0usize;
+    let mut run_kind = TokenKind::Unknown;
+
+    // `kind_at(col)` = the last span that covers `col`, or Unknown.
+    let mut si = 0usize;
+    let kind_at = |col: u32, si: &mut usize, active: &mut Option<(u32, TokenKind)>| {
+        // Advance past spans that ended before this column.
+        while let Some((end, _)) = *active {
+            if end <= col {
+                *active = None;
+            } else {
+                break;
+            }
+        }
+        while let Some(sp) = spans.get(*si) {
+            if sp.start_col > col {
+                break;
+            }
+            // A later span starting here replaces the current one.
+            if sp.end_col > col {
+                *active = Some((sp.end_col, sp.kind));
+            }
+            *si += 1;
+        }
+        active.map(|(_, k)| k).unwrap_or(TokenKind::Unknown)
+    };
+
+    for (i, _c) in chars.iter().enumerate() {
+        let col = base + i as u32;
+        let kind = kind_at(col, &mut si, &mut active);
+        if i == 0 {
+            run_kind = kind;
+            run_start = 0;
+            continue;
+        }
+        if kind != run_kind {
+            let text: String = chars[run_start..i].iter().collect();
+            r.text(l.text_x, y, &text, p.syntax(run_kind));
+            run_start = i;
+            run_kind = kind;
+        }
+    }
+    let text: String = chars[run_start..].iter().collect();
+    r.text(l.text_x, y, &text, p.syntax(run_kind));
+}
+
 fn visible_slice(line: &str, scroll_x: usize, cols: usize) -> &str {
     if scroll_x == 0 {
         // Fast path: take at most `cols` characters.
