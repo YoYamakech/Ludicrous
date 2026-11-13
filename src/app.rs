@@ -1428,7 +1428,10 @@ impl App {
         let chrome = view::Chrome {
             title: &title,
             modified,
-            maximized: window.is_maximized(),
+            // Fullscreen counts as "maximized" for drawing: no rounded
+            // corners on a screen edge, and the button must offer Restore
+            // (issue #6.8).
+            maximized: window.is_maximized() || window.fullscreen().is_some(),
             hover,
             focus: self.focus,
             caret: self.blink_on || !self.config.cursor_blink,
@@ -1876,8 +1879,19 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                     Some(Target::Button(WindowButton::Maximize)) => {
-                        if let Some(w) = self.window.as_ref() {
+                        // In F11 fullscreen the button's job is to leave
+                        // fullscreen; `set_maximized` alone would not do it.
+                        // Otherwise it is the ordinary maximize toggle.
+                        if self
+                            .window
+                            .as_ref()
+                            .map(|w| w.fullscreen().is_some())
+                            .unwrap_or(false)
+                        {
+                            self.toggle_fullscreen();
+                        } else if let Some(w) = self.window.as_ref() {
                             w.set_maximized(!w.is_maximized());
+                            w.request_redraw();
                         }
                     }
                     Some(Target::Button(WindowButton::Close)) => {
