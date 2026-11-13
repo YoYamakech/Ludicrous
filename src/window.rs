@@ -46,6 +46,41 @@ pub struct HitState {
     pub buttons_left: bool,
 }
 
+/// Where the sidebar toggle, the title text and the window buttons start.
+///
+/// With the buttons on the left the toggle moves right of them, and the title
+/// moves right of the toggle: otherwise the traffic lights sit on top of the
+/// panel icon and `Ludicrous` (issue #6.2). Drawing and hit testing both read
+/// this, so the two can never drift apart.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TitleLayout {
+    /// Left edge of the sidebar toggle hit region.
+    pub toggle_x: f32,
+    /// Left edge of the title text.
+    pub title_x: f32,
+    /// Left edge of the (three-button) window group.
+    pub buttons_x: f32,
+}
+
+impl TitleLayout {
+    pub fn new(width: f32, buttons_left: bool) -> Self {
+        if buttons_left {
+            let toggle_x = BUTTON_W * 3.0;
+            Self {
+                toggle_x,
+                title_x: toggle_x + TOGGLE_W,
+                buttons_x: 0.0,
+            }
+        } else {
+            Self {
+                toggle_x: 0.0,
+                title_x: TOGGLE_W,
+                buttons_x: width - BUTTON_W * 3.0,
+            }
+        }
+    }
+}
+
 /// Push the title bar and the resize edges into the hit map, back to front.
 ///
 /// Order matters: the edges are pushed last because they are the front-most few
@@ -57,16 +92,12 @@ pub fn chrome_regions(out: &mut HitMap, size: (f32, f32), state: HitState) {
     // Title bar: exactly one region per drawn thing, in the same order as
     // `ui/view.rs` draws them.
     out.push(Rect::new(0.0, 0.0, w, TITLE_H), Target::TitleDrag);
+    let t = TitleLayout::new(w, state.buttons_left);
     out.push(
-        Rect::new(0.0, 0.0, TOGGLE_W, TITLE_H),
+        Rect::new(t.toggle_x, 0.0, TOGGLE_W, TITLE_H),
         Target::SidebarToggle,
     );
-    let buttons_w = BUTTON_W * 3.0;
-    let start = if state.buttons_left {
-        TOGGLE_W
-    } else {
-        w - buttons_w
-    };
+    let start = t.buttons_x;
     let order = if state.buttons_left {
         [
             WindowButton::Close,
@@ -227,6 +258,38 @@ mod tests {
                 "{pos:?}"
             );
         }
+    }
+
+    #[test]
+    fn left_buttons_push_the_toggle_and_title_right() {
+        let right = TitleLayout::new(1000.0, false);
+        assert_eq!(right.buttons_x, 1000.0 - BUTTON_W * 3.0);
+        assert_eq!(right.toggle_x, 0.0);
+        assert_eq!(right.title_x, TOGGLE_W);
+
+        let left = TitleLayout::new(1000.0, true);
+        assert_eq!(left.buttons_x, 0.0);
+        // The toggle starts after the whole button group, and the title after
+        // the toggle: nothing overlaps (issue #6.2).
+        assert_eq!(left.toggle_x, BUTTON_W * 3.0);
+        assert_eq!(left.title_x, BUTTON_W * 3.0 + TOGGLE_W);
+        assert!(left.title_x > BUTTON_W * 3.0 + 22.0);
+    }
+
+    #[test]
+    fn fullscreen_windows_have_no_resize_edges() {
+        // A fullscreen window has no resize edges either.
+        let mut map = HitMap::new();
+        chrome_regions(
+            &mut map,
+            (800.0, 600.0),
+            HitState {
+                maximized: true,
+                fullscreen: true,
+                buttons_left: false,
+            },
+        );
+        assert!(map.target_at((799.0, 599.0)).is_none(), "no resize edge");
     }
 
     #[test]

@@ -119,16 +119,27 @@ fn draw_title_bar(r: &mut Renderer, l: &Layout, chrome: &Chrome) {
     r.rect(0.0, 0.0, l.width, h, p.sidebar_bg);
     r.rect(0.0, h - 1.0, l.width, 1.0, p.border);
 
+    // One shared layout decides where the toggle, the title and the buttons
+    // go, so left-aligned window buttons can never sit on the title
+    // (issue #6.2).
+    let t = crate::window::TitleLayout::new(l.width, chrome.buttons_left);
+
     // Sidebar toggle: the panel icon, on a subtle hover pill.
     let toggle_hover = matches!(chrome.hover, Some(Target::SidebarToggle));
     if toggle_hover {
-        r.rounded_rect(4.0, 4.0, 22.0, h - 8.0, 4.0, p.pill_hover);
+        r.rounded_rect(t.toggle_x + 4.0, 4.0, 22.0, h - 8.0, 4.0, p.pill_hover);
     }
-    r.icon(6.0, (h - 16.0) * 0.5, Icon::Sidebar, 16.0, p.muted);
+    r.icon(
+        t.toggle_x + 6.0,
+        (h - 16.0) * 0.5,
+        Icon::Sidebar,
+        16.0,
+        p.muted,
+    );
 
     // Title text, centred vertically in the bar.
     let text_y = (h - l.cell_h) * 0.5 + 1.0;
-    let title_x = 30.0;
+    let title_x = t.title_x;
     r.text_ui(title_x, text_y, chrome.title, p.text);
     if chrome.modified {
         let dot_x = title_x + r.ui_text_width(chrome.title) + 6.0;
@@ -152,11 +163,7 @@ fn draw_title_bar(r: &mut Renderer, l: &Layout, chrome: &Chrome) {
             WindowButton::Close,
         ]
     };
-    let start = if chrome.buttons_left {
-        crate::window::TOGGLE_W
-    } else {
-        l.width - bw * 3.0
-    };
+    let start = t.buttons_x;
     for (i, button) in order.into_iter().enumerate() {
         let x = start + i as f32 * bw;
         let hovered = chrome.hover == Some(Target::Button(button));
