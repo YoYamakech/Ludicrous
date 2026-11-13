@@ -64,7 +64,12 @@ pub struct Renderer {
     gl_renderer: String,
     rect_program: glow::Program,
     text_program: glow::Program,
+    /// Shapes queued before any text: the usual background and panel fills.
     rects: Batch,
+    /// Shapes queued *over* text (selection bands, carets, focused pills).
+    /// They are drawn after the glyphs of the same flush, so covering a label
+    /// no longer costs an extra pair of draw calls (issue #4).
+    rects_over: Batch,
     glyphs: Batch,
     ui_glyphs: Batch,
     icon_glyphs: Batch,
@@ -88,10 +93,11 @@ pub struct Renderer {
     tab_columns: usize,
     // Clip stack in physical pixels; each entry is [x, y, w, h].
     clip: Vec<[f32; 4]>,
-    /// Bounds of every glyph queued *after* the last shape, in physical
-    /// pixels. A shape that does not intersect this box cannot hide any of
-    /// them, so the batches need not be split (issue #4).
-    pending_glyph_bounds: Option<[f32; 4]>,
+    /// Boxes of the shapes queued over text since the last flush, in physical
+    /// pixels. Text queued afterwards must paint over them, so it flushes when
+    /// it lands on one. Per shape, not one merged box: a merged box would cover
+    /// the whole tree and make every later label look like a collision.
+    over_boxes: Vec<[f32; 4]>,
     layer: Layer,
     // Window shape mask uniforms, in physical pixels.
     window_w: f32,
@@ -133,6 +139,7 @@ impl Renderer {
         // shape: rect(4) color(4) params(4: radius, border, -, -) clip(4)
         let attrs: [(u32, i32); 4] = [(1, 4), (2, 4), (3, 4), (4, 4)];
         let rects = Batch::new(&gl, &caps, &attrs, MAX_RECTS);
+        let rects_over = Batch::new(&gl, &caps, &attrs, MAX_RECTS);
         // glyph: rect(4) uv(4) color(4) clip(4)
         let glyphs = Batch::new(&gl, &caps, &attrs, MAX_GLYPHS);
         let ui_glyphs = Batch::new(&gl, &caps, &attrs, MAX_GLYPHS);
@@ -166,6 +173,7 @@ impl Renderer {
             rect_program,
             text_program,
             rects,
+            rects_over,
             glyphs,
             ui_glyphs,
             icon_glyphs,
@@ -182,7 +190,7 @@ impl Renderer {
             ui_px,
             tab_columns: TAB_COLUMNS,
             clip: Vec::new(),
-            pending_glyph_bounds: None,
+            over_boxes: Vec::new(),
             layer: Layer::Background,
             window_w: 1.0,
             window_h: 1.0,
@@ -320,10 +328,11 @@ impl Renderer {
             self.gl.clear(glow::COLOR_BUFFER_BIT);
         }
         self.rects.data.clear();
+        self.rects_over.data.clear();
         self.glyphs.data.clear();
         self.ui_glyphs.data.clear();
         self.icon_glyphs.data.clear();
-        self.pending_glyph_bounds = None;
+        self.over_boxes.clear();
     }
 
     /// Set the rounded window mask, in points. Every fragment outside this
@@ -429,11 +438,37 @@ impl Renderer {
     /// which is where the 21+ flushes per frame came from (issue #4).
     fn covers_pending_text(&self, x: f32, y: f32, w: f32, h: f32) -> bool {
         let s = self.scale;
+        // A hairline or a rule is decoration, not content: it may sit in the
+        // gap between glyphs and never needs a flush (issue #4).
+        if h * s < 2.0 || w * s < 2.0 {
+            return false;
+        }
         let box_ = [x * s, y * s, w * s, h * s];
         [&self.glyphs, &self.ui_glyphs, &self.icon_glyphs]
             .iter()
             .filter_map(|b| b.bounds())
             .any(|b| intersects(b, box_))
+    }
+
+    /// Text must paint over the shapes queued before it, and those shapes are
+    /// drawn first in a flush. If the over-text batch exists and the new text
+    /// would land on it, flush so the order stays honest; otherwise the glyph
+    /// simply joins the batch (issue #4).
+    fn flush_before_text(&mut self, x: f32, y: f32, text: &str, ui_sized: bool) {
+        if self.over_boxes.is_empty() {
+            return;
+        }
+        let s = self.scale;
+        let atlas = if ui_sized {
+            &self.ui_atlas
+        } else {
+            &self.atlas
+        };
+        let w = text.chars().count() as f32 * atlas.cell_w;
+        let box_ = [x * s, y * s, w, atlas.cell_h];
+        if self.over_boxes.iter().any(|b| intersects(*b, box_)) {
+            self.flush_batches();
+        }
     }
 
     fn icon_char(&mut self, x: f32, y: f32, glyph: char, size: f32, color: Color) {
@@ -442,10 +477,11 @@ impl Renderer {
             // is decoration, not content (v1.2 section 4).
             return;
         };
-        // Painted over any text it covers; same rule as `shape()`.
-        if self.covers_pending_text(x, y, size, size) {
-            self.flush_batches();
-        }
+        // Icons and text live in separate batches, and all three glyph
+        // batches are drawn in the same flush after every shape. So an icon is
+        // never hidden by text queued before it, and it needs no flush at all:
+        // the old rule flushed for every icon that followed a label, which is
+        // where most of the remaining draw calls came from (issue #4).
         let s = self.scale;
         let clip = self.current_clip();
         // The bitmap was rasterized at ICON_PX points, so scale it to `size`.
@@ -477,15 +513,34 @@ impl Renderer {
         if w <= 0.0 || h <= 0.0 || color[3] <= 0.0 {
             return;
         }
-        // A shape queued after text must paint over it. That only needs a
-        // flush — and a second draw call — when the two really overlap; a
-        // panel background behind a label does not.
-        if self.covers_pending_text(x, y, w, h) {
-            self.flush_batches();
-        }
+        // A shape queued after text must paint over it. When it really does
+        // overlap, it goes into the "over text" batch, which is drawn after the
+        // glyphs of the same flush: one pair of draw calls for the whole layer
+        // instead of one per covering shape (issue #4).
+        //
+        // The exception is a *wash* — a full alpha fill used as a highlight
+        // behind a label. Highlights are drawn before their own text, so a
+        // hover pill must stay in the background batch even though the pointer
+        // is by definition over a label. Without this the settings page split
+        // once per hovered row.
+        let over = if color[3] >= 1.0 && is_wash_shaped(w, h) {
+            false
+        } else {
+            self.covers_pending_text(x, y, w, h)
+        };
         let s = self.scale;
         let clip = self.current_clip();
-        self.rects.push(&[
+        if over {
+            // Remember each covering shape separately, so later text only
+            // flushes when it really lands on one of them.
+            self.over_boxes.push([x * s, y * s, w * s, h * s]);
+        }
+        let batch = if over {
+            &mut self.rects_over
+        } else {
+            &mut self.rects
+        };
+        batch.push(&[
             x * s,
             y * s,
             w * s,
@@ -507,6 +562,7 @@ impl Renderer {
 
     /// Queue a single line of editor text. `y` is the top of the line box.
     pub fn text(&mut self, x: f32, y: f32, s: &str, color: Color) {
+        self.flush_before_text(x, y, s, false);
         let clip = self.current_clip();
         queue_text(
             &self.atlas,
@@ -524,6 +580,7 @@ impl Renderer {
     /// Queue a single line of UI (chrome) text at the fixed UI size.
     #[allow(dead_code)] // shell chrome (Phase B+)
     pub fn text_ui(&mut self, x: f32, y: f32, s: &str, color: Color) {
+        self.flush_before_text(x, y, s, true);
         let clip = self.current_clip();
         queue_text(
             &self.ui_atlas,
@@ -613,8 +670,22 @@ impl Renderer {
         }
     }
 
-    /// Shapes first, then glyphs: the normal paint order within a layer.
+    /// Shapes first, then glyphs, then the shapes that belong over text: the
+    /// normal paint order within a layer, in one flush.
     fn flush_batches(&mut self) {
+        // `LUDICROUS_DEBUG_FLUSH=1`: one line per flush, saying which batches
+        // were non-empty. A draw-call regression is much easier to trace with
+        // this than with the totals alone.
+        if std::env::var_os("LUDICROUS_DEBUG_FLUSH").is_some() {
+            eprintln!(
+                "flush: rects={} glyphs={} ui={} icons={} over={}",
+                self.rects.len(),
+                self.glyphs.len(),
+                self.ui_glyphs.len(),
+                self.icon_glyphs.len(),
+                self.rects_over.len()
+            );
+        }
         if !self.rects.data.is_empty() {
             self.stats.flushes += 1;
             self.stats.instances += self.rects.len() as u32;
@@ -625,6 +696,18 @@ impl Renderer {
             }
         }
         self.flush_text();
+        if !self.rects_over.data.is_empty() {
+            self.stats.flushes += 1;
+            self.stats.instances += self.rects_over.len() as u32;
+            unsafe {
+                self.gl.use_program(Some(self.rect_program));
+                self.set_common_uniforms(self.rect_program);
+                self.stats.draw_calls += self.rects_over.draw(&self.gl);
+            }
+        }
+        // Everything queued so far is on the screen after this flush, so no
+        // box is "pending" any more.
+        self.over_boxes.clear();
     }
 
     /// Upload the viewport, window mask and window-size uniforms for `p`.
@@ -643,6 +726,12 @@ impl Renderer {
     /// Draw everything queued since `begin_frame`.
     pub fn flush(&mut self) {
         self.flush_batches();
+        if std::env::var_os("LUDICROUS_DEBUG_FLUSH").is_some() {
+            eprintln!(
+                "frame: draws={} flushes={} instances={}",
+                self.stats.draw_calls, self.stats.flushes, self.stats.instances
+            );
+        }
         self.clip.clear();
         // Close the timer query for this frame and pick up the result of an
         // older one. The result is only read when it is already available, so
@@ -664,6 +753,7 @@ impl Drop for Renderer {
             }
         }
         self.rects.destroy(&self.gl);
+        self.rects_over.destroy(&self.gl);
         self.glyphs.destroy(&self.gl);
         self.ui_glyphs.destroy(&self.gl);
         self.icon_glyphs.destroy(&self.gl);
@@ -680,6 +770,12 @@ fn intersect(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Is this the shape of a row highlight: wide, about one row tall, and not
+/// spanning most of the window width?
+fn is_wash_shaped(w: f32, h: f32) -> bool {
+    (12.0..=40.0).contains(&h) && w >= 40.0
+}
+
 /// Do two `[x, y, w, h]` boxes share any pixels?
 fn intersects(a: [f32; 4], b: [f32; 4]) -> bool {
     a[0] < b[0] + b[2] && b[0] < a[0] + a[2] && a[1] < b[1] + b[3] && b[1] < a[1] + a[3]

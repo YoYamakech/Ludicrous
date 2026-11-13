@@ -187,6 +187,14 @@ pub fn draw(
         p.muted,
     );
 
+    // Row separators first, all of them: a hairline in the gap between two
+    // rows never covers a label, and queueing them up front keeps them in the
+    // background batch instead of splitting the frame once per row (#4).
+    for i in 1..Row::COUNT {
+        let y = geo.row_y(i);
+        r.rect(geo.x, y - 1.0, geo.w, 1.0, p.border);
+    }
+
     for (i, row) in Row::ALL.iter().enumerate() {
         let y = geo.row_y(i);
         let focused = i == selected;
@@ -202,11 +210,6 @@ pub fn draw(
             other => other.label(),
         };
 
-        // A full-width hairline between rows keeps the page readable without
-        // boxes.
-        if i > 0 {
-            r.rect(geo.x, y - 1.0, geo.w, 1.0, p.border);
-        }
         // The hover wash is drawn by `draw_row`, behind the control, so it can
         // never cover a label (issue #6.3).
         widgets::draw_row(r, p, y, geo.x, geo.w, label, &widget, focused, hovered);
