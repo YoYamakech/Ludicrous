@@ -37,6 +37,13 @@ pub struct SidebarState {
     pub hover_icon: Option<usize>,
     /// File-tree scroll offset in points (always a whole number of rows).
     pub scroll: f32,
+    /// Fade-in of the currently hovered row, 0..1. With animations off it is
+    /// always 1, so hover is instant.
+    pub hover_alpha: f32,
+    /// The row just left, still fading out, and its own alpha. Only these two
+    /// rows ever animate: no per-row state (v1.2 section 8).
+    pub fade_from: Option<Target>,
+    pub fade_alpha: f32,
 }
 
 /// Vertical geometry of the sidebar, recomputed each frame.
@@ -219,7 +226,21 @@ pub fn draw(
         if i == ws.active {
             pill(r, inner_x, y, inner_w, p.pill_active);
         } else if state.hover_open == Some(i) {
-            pill(r, inner_x, y, inner_w, p.pill_hover);
+            pill(
+                r,
+                inner_x,
+                y,
+                inner_w,
+                faded(p.pill_hover, state.hover_alpha),
+            );
+        } else if state.fade_from == Some(Target::OpenFile(i)) {
+            pill(
+                r,
+                inner_x,
+                y,
+                inner_w,
+                faded(p.pill_hover, state.fade_alpha),
+            );
         }
         // The open-files row knows the buffer's path, so it gets the same icon
         // as the tree entry for the same file.
@@ -269,7 +290,21 @@ pub fn draw(
         if n == state.selected && focus == Focus::Sidebar {
             pill(r, inner_x, y, inner_w, p.pill_active);
         } else if state.hover_tree == Some(n) {
-            pill(r, inner_x, y, inner_w, p.pill_hover);
+            pill(
+                r,
+                inner_x,
+                y,
+                inner_w,
+                faded(p.pill_hover, state.hover_alpha),
+            );
+        } else if state.fade_from == Some(Target::TreeRow(n)) {
+            pill(
+                r,
+                inner_x,
+                y,
+                inner_w,
+                faded(p.pill_hover, state.fade_alpha),
+            );
         }
 
         let indent = pad + 2.0 + row.depth as f32 * 14.0;
@@ -301,7 +336,21 @@ pub fn draw(
 
     // Footer: Settings row.
     if state.hover_icon == Some(0) {
-        pill(r, inner_x, geo.footer_y, inner_w, p.pill_hover);
+        pill(
+            r,
+            inner_x,
+            geo.footer_y,
+            inner_w,
+            faded(p.pill_hover, state.hover_alpha),
+        );
+    } else if state.fade_from == Some(Target::SidebarSettings) {
+        pill(
+            r,
+            inner_x,
+            geo.footer_y,
+            inner_w,
+            faded(p.pill_hover, state.fade_alpha),
+        );
     }
     r.icon(
         pad + 2.0,
@@ -342,6 +391,11 @@ fn draw_rail(r: &mut Renderer, geo: &Geometry, state: &SidebarState, p: &Palette
     let first = geo.top + theme::PAD;
     for (i, icon) in [Icon::Files, Icon::Gear].into_iter().enumerate() {
         let y = first + i as f32 * RAIL_SLOT;
+        let rail_target = if i == 0 {
+            Target::RailFiles
+        } else {
+            Target::RailSettings
+        };
         if state.hover_icon == Some(i) {
             r.rounded_rect(
                 theme::PAD * 0.5,
@@ -349,7 +403,16 @@ fn draw_rail(r: &mut Renderer, geo: &Geometry, state: &SidebarState, p: &Palette
                 w - theme::PAD,
                 RAIL_SLOT - 8.0,
                 theme::PILL_RADIUS,
-                p.pill_hover,
+                faded(p.pill_hover, state.hover_alpha),
+            );
+        } else if state.fade_from == Some(rail_target) {
+            r.rounded_rect(
+                theme::PAD * 0.5,
+                y + 4.0,
+                w - theme::PAD,
+                RAIL_SLOT - 8.0,
+                theme::PILL_RADIUS,
+                faded(p.pill_hover, state.fade_alpha),
             );
         }
         let size = 18.0;
@@ -361,6 +424,12 @@ fn draw_rail(r: &mut Renderer, geo: &Geometry, state: &SidebarState, p: &Palette
             p.muted,
         );
     }
+}
+
+/// Scale a colour's alpha. A fade is the same colour at a lower opacity, so
+/// only the fourth channel changes and the palette stays in one place.
+fn faded(c: Color, alpha: f32) -> Color {
+    [c[0], c[1], c[2], c[3] * alpha.clamp(0.0, 1.0)]
 }
 
 fn pill(r: &mut Renderer, x: f32, y: f32, w: f32, color: Color) {

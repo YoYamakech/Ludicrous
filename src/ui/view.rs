@@ -36,6 +36,10 @@ pub struct Chrome<'a> {
     pub buttons_left: bool,
     /// False during the dark half of a blinking cursor.
     pub caret: bool,
+    /// Vertical scroll in (fractional) lines. Whole numbers when animations are
+    /// off; in between while a scroll is easing. Glyphs are always placed on
+    /// whole pixels, so the text never blurs.
+    pub scroll_lines: f32,
     /// True while files are being dragged over the window: draw the drop
     /// highlight (v1.2 section 5.2).
     pub drop_hover: bool,
@@ -60,7 +64,7 @@ pub fn draw(r: &mut Renderer, ws: &Workspace, l: &Layout, chrome: &Chrome) {
         sidebar::draw(r, ws, l, &geo, &chrome.sidebar, chrome.focus, p);
     }
     if !chrome.settings {
-        draw_editor(r, ed, l, p, chrome.caret);
+        draw_editor(r, ed, l, p, chrome.caret, chrome.scroll_lines);
     }
     draw_status_bar(r, ed, l, p);
 
@@ -169,7 +173,14 @@ fn draw_title_bar(r: &mut Renderer, l: &Layout, chrome: &Chrome) {
     }
 }
 
-fn draw_editor(r: &mut Renderer, ed: &Editor, l: &Layout, p: &Palette, caret: bool) {
+fn draw_editor(
+    r: &mut Renderer,
+    ed: &Editor,
+    l: &Layout,
+    p: &Palette,
+    caret: bool,
+    scroll_lines: f32,
+) {
     let body_top = l.title_h;
     let body_h = l.height - l.status_h - body_top;
 
@@ -179,15 +190,20 @@ fn draw_editor(r: &mut Renderer, ed: &Editor, l: &Layout, p: &Palette, caret: bo
         r.rect(l.sidebar_w + l.gutter_w, body_top, 1.0, body_h, p.border);
     }
 
-    let first = ed.scroll;
-    let last = (first + l.rows).min(ed.buffer.line_count());
+    // The animated position may sit between two lines. `first` is the top line
+    // that is (partly) visible and `frac` how far it has moved up, in lines.
+    let anim = scroll_lines.max(0.0);
+    let first = anim.floor() as usize;
+    let frac = anim - first as f32;
+    // One extra line at the bottom because the top one is partly scrolled out.
+    let last = (first + l.rows + 1).min(ed.buffer.line_count());
     let mut digits_buf = [0u8; 20];
 
     // Line numbers live in the gutter, outside the text-area clip, so they are
     // drawn first. `show_line_numbers` can turn them off entirely.
     if l.show_numbers {
         for idx in first..last {
-            let y = l.text_y + (idx - first) as f32 * l.cell_h;
+            let y = l.text_y + (idx - first) as f32 * l.cell_h - frac * l.cell_h;
             let num = format_usize(idx + 1, &mut digits_buf);
             let nx = (l.sidebar_w + l.gutter_w - GUTTER_PAD - num.len() as f32 * l.cell_w).max(0.0);
             r.text(nx, y, num, p.gutter_text);
@@ -204,7 +220,8 @@ fn draw_editor(r: &mut Renderer, ed: &Editor, l: &Layout, p: &Palette, caret: bo
     );
 
     for idx in first..last {
-        let y = l.text_y + (idx - first) as f32 * l.cell_h;
+        // Whole pixels only: a glyph drawn at a fractional y is blurry.
+        let y = (l.text_y + (idx - first) as f32 * l.cell_h - frac * l.cell_h).round();
 
         let line = ed.buffer.line(idx);
         // Selection highlight goes behind the text of this line.
@@ -230,8 +247,8 @@ fn draw_editor(r: &mut Renderer, ed: &Editor, l: &Layout, p: &Palette, caret: bo
     // Cursor: a thin vertical bar at the character cell under the cursor.
     // The x comes from the renderer's pen position, not `col * cell_w`, so it
     // lines up with the glyphs (see issue #1: fractional advance drift).
-    if caret && ed.cursor.line >= first && ed.cursor.line < last {
-        let y = l.text_y + (ed.cursor.line - first) as f32 * l.cell_h;
+    if caret && ed.cursor.line >= first && ed.cursor.line < last + 1 {
+        let y = (l.text_y + (ed.cursor.line - first) as f32 * l.cell_h - frac * l.cell_h).round();
         let line = ed.buffer.line(ed.cursor.line);
         // Both positions are measured on the full line, so tab stops stay
         // correct; the difference is where the caret sits in the scrolled view.

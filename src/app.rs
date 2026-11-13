@@ -137,6 +137,13 @@ pub struct App {
     /// How many times `set_cursor` actually reached the window. The spec asks
     /// for a counter that proves it only runs when the kind changes.
     cursor_sets: u32,
+    /// Animated sidebar width, hover fade and smooth scroll (v1.2 section 8).
+    /// Pure state: it never touches GL, and when nothing moves the loop waits.
+    anims: crate::ui::anim::UiAnims,
+    /// When the previous frame started, for `dt`. Only read while animating.
+    last_frame: std::time::Instant,
+    /// `LUDICROUS_DEBUG_ANIM=1`: log the animated values once per frame.
+    anim_debug: bool,
 }
 
 impl App {
@@ -178,6 +185,9 @@ impl App {
             time_to_window_ms: None,
             time_to_first_frame_ms: None,
             cursor_sets: 0,
+            anims: crate::ui::anim::UiAnims::default(),
+            last_frame: std::time::Instant::now(),
+            anim_debug: std::env::var_os("LUDICROUS_DEBUG_ANIM").is_some(),
         }
     }
 
@@ -272,7 +282,7 @@ impl App {
             Some(self.config.sidebar)
         } else {
             let w = self.state.width;
-            match self.sidebar_width(w) {
+            match self.sidebar_target(w) {
                 w if w >= theme::SIDEBAR_W => Some(SidebarMode::Expanded),
                 w if w >= theme::SIDEBAR_RAIL_W => Some(SidebarMode::Rail),
                 _ => Some(SidebarMode::Hidden),
@@ -476,6 +486,9 @@ impl App {
             window.set_maximized(true);
         }
         self.window = Some(window);
+        // The first frame must show the sidebar already at its width, not
+        // sliding open: animations only start when something changes.
+        self.snap_sidebar();
         // The surface exists and the context is current: window done.
         self.timing(false);
         Ok(())
@@ -486,7 +499,9 @@ impl App {
     /// Auto mode collapses to a rail under 900 px and hides under 600 px. A
     /// manual Ctrl+B toggle wins until the window is resized across one of
     /// those thresholds (see `on_resize`).
-    fn sidebar_width(&self, w: f32) -> f32 {
+    /// Where the sidebar is heading, from the config and the window width.
+    /// Pure: it says nothing about where the animation currently is.
+    fn sidebar_target(&self, w: f32) -> f32 {
         // The configured mode wins; `Auto` falls back to the width thresholds.
         match self.config.sidebar {
             SidebarMode::Expanded => return theme::SIDEBAR_W,
@@ -521,7 +536,7 @@ impl App {
             ed.buffer.line_count(),
             w,
             h,
-            self.sidebar_width(w),
+            self.sidebar_width(),
         ))
     }
 
@@ -671,8 +686,8 @@ impl App {
                 win.inner_size().width as f32 / s
             })
             .unwrap_or(1000.0);
-        let expanded = self.sidebar_width(w) >= theme::SIDEBAR_W;
-        let rail = self.sidebar_width(w) >= theme::SIDEBAR_RAIL_W && !expanded;
+        let expanded = self.sidebar_target(w) >= theme::SIDEBAR_W;
+        let rail = self.sidebar_target(w) >= theme::SIDEBAR_RAIL_W && !expanded;
         // Expanded <-> hidden; a rail-mode sidebar toggles its rail instead.
         self.sidebar_manual = Some(if rail { expanded } else { !expanded });
     }
@@ -832,15 +847,91 @@ impl App {
         }
     }
 
+    /// The sidebar width to draw and hit-test with: the animation's current
+    /// value, which equals the target when nothing is moving.
+    fn sidebar_width(&self) -> f32 {
+        self.anims.value(crate::ui::anim::Which::Sidebar)
+    }
+
+    /// Advance every animation by the frame time. Returns true while anything
+    /// is still moving; the caller then asks for exactly one more frame.
+    fn step_anims(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        let dt = crate::ui::anim::dt_seconds(now - self.last_frame);
+        self.last_frame = now;
+        self.sync_anims();
+        // Hover fade: the entered row fades in, the left one fades out.
+        let hover_target = self.anims.value(crate::ui::anim::Which::Hover);
+        self.sidebar.hover_alpha = hover_target.clamp(0.0, 1.0);
+        if self.sidebar.fade_from.is_some() {
+            // The fade-out runs on the same eased curve, in reverse.
+            self.sidebar.fade_alpha -= dt * 6.0;
+            if self.sidebar.fade_alpha <= 0.0 {
+                self.sidebar.fade_alpha = 0.0;
+                self.sidebar.fade_from = None;
+            }
+        }
+        let moving = self.anims.step(dt);
+        moving || self.sidebar.fade_from.is_some()
+    }
+
+    /// Is anything in the UI mid-animation right now? Shown in the F3 overlay.
+    fn animating(&self) -> bool {
+        self.anims.is_moving(crate::ui::anim::Which::Sidebar)
+            || self.anims.is_moving(crate::ui::anim::Which::Scroll)
+            || self.anims.is_moving(crate::ui::anim::Which::Hover)
+            || self.sidebar.fade_from.is_some()
+    }
+
+    /// Point the sidebar animation at where it belongs for the current window,
+    /// then keep the other animations in step with the state. Called from
+    /// `about_to_wait`, so resize, Ctrl+B and a settings change are all caught
+    /// without every call site having to remember.
+    fn sync_anims(&mut self) {
+        self.anims.enabled = self.config.animations;
+        let w = self
+            .window
+            .as_ref()
+            .map(|win| {
+                let s = win.scale_factor() as f32;
+                win.inner_size().width as f32 / s
+            })
+            .unwrap_or(1000.0);
+        let target = self.sidebar_target(w);
+        self.anims.set(crate::ui::anim::Which::Sidebar, target);
+        // Hover fade: one value for whatever is hovered right now.
+        let hover = if self.hover.is_some() { 1.0 } else { 0.0 };
+        self.anims.set(crate::ui::anim::Which::Hover, hover);
+        // Smooth scrolling chases the editor's whole-line scroll position.
+        let lines = self
+            .workspace
+            .as_ref()
+            .and_then(|ws| ws.active_editor())
+            .map(|ed| ed.scroll as f32)
+            .unwrap_or(0.0);
+        self.anims.set(crate::ui::anim::Which::Scroll, lines);
+    }
+
+    /// Jump the sidebar straight to its target: used once, when the window is
+    /// created, so startup does not play an animation.
+    fn snap_sidebar(&mut self) {
+        let w = self
+            .window
+            .as_ref()
+            .map(|win| {
+                let s = win.scale_factor() as f32;
+                win.inner_size().width as f32 / s
+            })
+            .unwrap_or(1000.0);
+        let target = self.sidebar_target(w);
+        let anims = &mut self.anims;
+        anims.set(crate::ui::anim::Which::Sidebar, target);
+        anims.sidebar_w.snap_to_target();
+    }
+
     /// Sidebar width in points, or 0 when it is hidden.
     fn sidebar_width_of_window(&self) -> f32 {
-        self.window
-            .as_ref()
-            .map(|w| {
-                let s = w.scale_factor() as f32;
-                self.sidebar_width(w.inner_size().width as f32 / s)
-            })
-            .unwrap_or(0.0)
+        self.sidebar_width()
     }
 
     /// Sidebar geometry for the current window, or `None` when it is hidden.
@@ -890,6 +981,16 @@ impl App {
             self.sidebar.hover_icon,
             self.hover,
         ) != (tree, open, icon, target);
+        // Hover fade: when the hovered sidebar row changes, the row just left
+        // becomes the one fading out. Only these two ever animate.
+        if changed && tree != self.sidebar.hover_tree {
+            self.sidebar.fade_from = self.sidebar.hover_tree.map(Target::TreeRow);
+            self.sidebar.fade_alpha = 1.0;
+        }
+        if changed && open != self.sidebar.hover_open {
+            self.sidebar.fade_from = self.sidebar.hover_open.map(Target::OpenFile);
+            self.sidebar.fade_alpha = 1.0;
+        }
         self.sidebar.hover_tree = tree;
         self.sidebar.hover_open = open;
         self.sidebar.hover_icon = icon;
@@ -1027,17 +1128,33 @@ impl App {
         // CPU frame time: how long it takes to build and submit one frame.
         // Measured with one monotonic read at the end of the frame.
         self.frame_started = std::time::Instant::now();
+        // Advance the animations first, so this frame draws the fresh value
+        // and the next frame is requested only while something still moves.
+        let moving = self.step_anims();
+        // Dev aid (like LUDICROUS_GL_SAFE): log the animated width every frame,
+        // so a slide can be checked without a video capture tool.
+        if self.anim_debug {
+            let ed_scroll = self
+                .workspace
+                .as_ref()
+                .and_then(|ws| ws.active_editor())
+                .map(|e| e.scroll)
+                .unwrap_or(0);
+            eprintln!(
+                "anim ed_scroll={ed_scroll} sidebar={:.1} scroll={:.2} moving={}",
+                self.sidebar_width(),
+                self.anims.value(crate::ui::anim::Which::Scroll),
+                moving
+            );
+        }
         // Read the chrome state before borrowing the GL state mutably.
         let title = self.title();
         let hover = self.hover;
-        let sidebar_w = self
-            .window
-            .as_ref()
-            .map(|w| {
-                let s = w.scale_factor() as f32;
-                self.sidebar_width(w.inner_size().width as f32 / s)
-            })
-            .unwrap_or(0.0);
+        // The animated width, not the target: the sidebar slides.
+        let sidebar_w = self.sidebar_width();
+        // Read before the GL state is borrowed mutably (it borrows `self`).
+        let animating = self.animating();
+        let scroll_pos = self.anims.value(crate::ui::anim::Which::Scroll);
         let (Some(window), Some(gl), Some(ws)) = (
             self.window.as_ref(),
             self.gl.as_mut(),
@@ -1069,6 +1186,13 @@ impl App {
         if let Some(ed) = ws.active_editor_mut() {
             ed.ensure_visible(rows, cols);
         }
+        // Keep the animation chasing the editor's own (clamped) scroll. This is
+        // a direct field access so it does not conflict with the `ws` borrow.
+        let scroll_now = ws.active_editor().map(|e| e.scroll as f32).unwrap_or(0.0);
+        self.anims.set(crate::ui::anim::Which::Scroll, scroll_now);
+        // Smooth scrolling: a fractional line offset. Glyphs are placed on
+        // whole pixels, so text stays crisp mid-move.
+        let scroll_lines = scroll_pos;
         let modified = ws.active_editor().map(|e| e.is_dirty()).unwrap_or(false);
         let palette = Palette::of(self.config.theme);
         let chrome = view::Chrome {
@@ -1079,6 +1203,7 @@ impl App {
             focus: self.focus,
             caret: self.blink_on || !self.config.cursor_blink,
             drop_hover: self.drop_hover,
+            scroll_lines,
             sidebar: self.sidebar.clone(),
             palette,
             settings: self.settings_open,
@@ -1116,7 +1241,7 @@ impl App {
                 cursor_sets: self.cursor_sets,
                 cursor: self.current_cursor.short(),
                 regions: self.hitmap.len(),
-                animating: false,
+                animating,
                 cpu_ms: self.last_cpu_ms,
                 gpu_ms,
                 draw_calls: stats.draw_calls,
@@ -1134,9 +1259,25 @@ impl App {
 
         r.flush();
         let _ = gl.surface.swap_buffers(&gl.context);
+        // The borrows of `window`, `gl` and `ws` end here, so the app can step
+        // its own state below.
         self.last_cpu_ms = self.frame_started.elapsed().as_secs_f32() * 1000.0;
         self.timing(true);
-        // Draw immediately, then wait for the next event.
+        // The layout moved under a still pointer, so the hit map and the
+        // cursor have to follow: v1.2 section 3b asks for exactly this during
+        // the sidebar animation.
+        if moving {
+            self.update_pointer();
+        }
+        // Ask for exactly one more frame while anything is still moving. The
+        // loop itself stays on `Wait` (never `Poll`): the redraw request is
+        // what wakes it, and vsync paces it.
+        if moving {
+            if let Some(w) = self.window.as_ref() {
+                w.request_redraw();
+            }
+        }
+        // Wait for the next event, or the blink deadline if blinking is on.
         event_loop.set_control_flow(ControlFlow::Wait);
     }
 }

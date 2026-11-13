@@ -54,6 +54,9 @@ pub struct Config {
     /// transparent, premultiplied window partial redraws are easy to get
     /// wrong). Not exposed on the settings page, which has eight fixed rows.
     pub experimental_damage: bool,
+    /// UI animations (sidebar width, smooth scrolling, hover fades). On by
+    /// default; off makes every change instant and keeps the loop at `Wait`.
+    pub animations: bool,
 }
 
 impl Default for Config {
@@ -68,6 +71,7 @@ impl Default for Config {
             sidebar: SidebarMode::Auto,
             theme: Theme::Dark,
             experimental_damage: false,
+            animations: true,
         }
     }
 }
@@ -178,6 +182,11 @@ impl Config {
                     self.experimental_damage = v;
                 }
             }
+            "animations" => {
+                if let Some(v) = parse_bool(value) {
+                    self.animations = v;
+                }
+            }
             _ => {} // unknown keys are forward compatible by design
         }
     }
@@ -195,7 +204,8 @@ impl Config {
              corner_radius = {}\n\
              sidebar = {}\n\
              theme = {}\n\
-             experimental_damage = {}\n",
+             experimental_damage = {}\n\
+             animations = {}\n",
             self.font_size,
             self.tab_width,
             self.show_line_numbers,
@@ -216,6 +226,7 @@ impl Config {
                 Theme::Light => "light",
             },
             self.experimental_damage,
+            self.animations,
         )
     }
 
@@ -415,8 +426,21 @@ mod tests {
             sidebar: SidebarMode::Rail,
             theme: Theme::Light,
             experimental_damage: true,
+            animations: false,
         };
         assert_eq!(Config::parse(&c.to_text()), c);
+    }
+
+    #[test]
+    fn animations_default_on_and_can_be_turned_off() {
+        assert!(Config::default().animations);
+        // `off` must be read from the file, because the acceptance test for
+        // section 8 writes it there by hand.
+        let c = Config::parse("animations = off\n");
+        assert!(!c.animations);
+        assert!(Config::parse("animations = on\n").animations);
+        // A broken value leaves the default alone rather than guessing.
+        assert!(Config::parse("animations = maybe\n").animations);
     }
 
     #[test]

@@ -27,10 +27,11 @@ pub enum Row {
     CornerRadius,
     Sidebar,
     Theme,
+    Animations,
 }
 
 impl Row {
-    pub const COUNT: usize = 8;
+    pub const COUNT: usize = 9;
     pub const ALL: [Row; Row::COUNT] = [
         Row::FontSize,
         Row::TabWidth,
@@ -40,6 +41,7 @@ impl Row {
         Row::CornerRadius,
         Row::Sidebar,
         Row::Theme,
+        Row::Animations,
     ];
 
     pub fn from_index(i: usize) -> Row {
@@ -56,6 +58,7 @@ impl Row {
             Row::CornerRadius => "Corner radius",
             Row::Sidebar => "Sidebar",
             Row::Theme => "Theme",
+            Row::Animations => "Animations",
         }
     }
 }
@@ -235,6 +238,7 @@ pub fn widget_for(row: Row, cfg: &Config) -> Widget<'static> {
                 Theme::Light => 1,
             },
         },
+        Row::Animations => Widget::Toggle(cfg.animations),
     }
 }
 
@@ -302,6 +306,7 @@ pub fn step(cfg: &mut Config, row: Row, delta: i32) -> bool {
                 Theme::Light => Theme::Dark,
             }
         }
+        Row::Animations => cfg.animations = !cfg.animations,
     }
     *cfg != before
 }
@@ -340,7 +345,7 @@ pub fn choose(cfg: &mut Config, row: Row, index: usize) -> bool {
             };
         }
         // Toggles and steppers are not segment choices.
-        Row::LineNumbers | Row::CursorBlink | Row::FontSize => {
+        Row::LineNumbers | Row::CursorBlink | Row::Animations | Row::FontSize => {
             return step(cfg, row, if index == 0 { -1 } else { 1 })
         }
     }
