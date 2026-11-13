@@ -24,6 +24,7 @@ use crate::input;
 use crate::render::Renderer;
 use crate::ui::focus::Focus;
 use crate::ui::layout::Layout;
+use crate::ui::overlay;
 use crate::ui::settings;
 use crate::ui::sidebar::{self, SidebarState};
 use crate::ui::theme;
@@ -82,6 +83,11 @@ pub struct App {
     blink_on: bool,
     /// When the blink phase flips next.
     blink_at: std::time::Instant,
+    /// F3 debug overlay. Closed by default and costs nothing while closed.
+    debug: bool,
+    /// Start of the current redraw, for the CPU frame time shown in the panel.
+    frame_started: std::time::Instant,
+    last_cpu_ms: f32,
 }
 
 impl App {
@@ -107,6 +113,9 @@ impl App {
             state: WindowState::default(),
             blink_on: true,
             blink_at: std::time::Instant::now(),
+            debug: false,
+            frame_started: std::time::Instant::now(),
+            last_cpu_ms: 0.0,
         }
     }
 
@@ -115,15 +124,33 @@ impl App {
     pub fn load_settings(&mut self) {
         self.config = Config::load();
         self.state = WindowState::load();
+        // A sidebar mode chosen with Ctrl+B (or a resize) last time wins over
+        // `auto`, matching the spec's "last sidebar mode" in the state file.
+        if self.config.sidebar == SidebarMode::Auto {
+            self.sidebar_manual = match self.state.sidebar {
+                Some(SidebarMode::Expanded) => Some(true),
+                Some(SidebarMode::Rail) | Some(SidebarMode::Hidden) => Some(false),
+                _ => None,
+            };
+        }
     }
 
     /// Push config values into the renderer/window after a live change: font
     /// sizes (which rebuild the atlases) and the window radius.
     fn apply_config(&mut self, old: &Config) {
         let font_changed = old.font_size != self.config.font_size;
+        let tab_changed = old.tab_width != self.config.tab_width;
         if let Some(gl) = self.gl.as_mut() {
             if font_changed {
                 gl.renderer.set_font_size(self.config.font_size as f32);
+            }
+            if tab_changed {
+                gl.renderer.set_tab_width(self.config.tab_width);
+            }
+        }
+        if tab_changed {
+            if let Some(ws) = self.workspace.as_mut() {
+                ws.set_indent(self.config.tab_width);
             }
         }
         // Saving is deliberate: only when a value actually changed.
@@ -166,6 +193,16 @@ impl App {
             self.state.height = size.height as f32 / scale;
             self.state.maximized = w.is_maximized();
         }
+        self.state.sidebar = if self.config.sidebar != SidebarMode::Auto {
+            Some(self.config.sidebar)
+        } else {
+            let w = self.state.width;
+            match self.sidebar_width(w) {
+                w if w >= theme::SIDEBAR_W => Some(SidebarMode::Expanded),
+                w if w >= theme::SIDEBAR_RAIL_W => Some(SidebarMode::Rail),
+                _ => Some(SidebarMode::Hidden),
+            }
+        };
         self.state.save();
     }
 
@@ -290,11 +327,23 @@ impl App {
         );
 
         let raw_handle = window.window_handle()?.as_raw();
-        let surface_attrs = SurfaceAttributesBuilder::<WindowSurface>::new().build(
-            raw_handle,
-            w.unwrap(),
-            h.unwrap(),
+        // sRGB check (section 9.1). A transparent window composites
+        // premultiplied alpha, and our shaders output already-encoded colours;
+        // asking the hardware to blend in linear space would fringe the
+        // rounded corners and glyph edges. So the check is reported and the
+        // path stays off unless explicitly requested for testing.
+        let srgb =
+            gl_config.srgb_capable() && std::env::var("LUDICROUS_SRGB").as_deref() == Ok("1");
+        eprintln!(
+            "ludicrous: framebuffer sRGB capable={} enabled={}",
+            gl_config.srgb_capable(),
+            srgb
         );
+        let mut surface_builder = SurfaceAttributesBuilder::<WindowSurface>::new();
+        if srgb {
+            surface_builder = surface_builder.with_srgb(Some(true));
+        }
+        let surface_attrs = surface_builder.build(raw_handle, w.unwrap(), h.unwrap());
         let surface = unsafe {
             gl_config
                 .display()
@@ -321,11 +370,12 @@ impl App {
         };
 
         let mut renderer = Renderer::new(gl, FONT, ICONS, self.config.font_size as f32);
+        renderer.set_tab_width(self.config.tab_width);
         renderer.set_scale(window.scale_factor() as f32);
 
         // Load the file only now: the window is already on screen, so a slow
         // disk or a huge file does not delay the first paint.
-        let ws = match self.path.as_deref() {
+        let mut ws = match self.path.as_deref() {
             Some(p) => match Workspace::open_argument(p) {
                 Ok(ws) => ws,
                 Err(e) => {
@@ -335,6 +385,9 @@ impl App {
             },
             None => Workspace::new(),
         };
+        // The saved tab width has to reach the editors opened above, not just
+        // ones created later by the settings page.
+        ws.set_indent(self.config.tab_width);
         self.workspace = Some(ws);
 
         self.gl = Some(GlState {
@@ -562,6 +615,10 @@ impl App {
     fn apply_after_settings_change(&mut self) {
         if let Some(gl) = self.gl.as_mut() {
             gl.renderer.set_font_size(self.config.font_size as f32);
+            gl.renderer.set_tab_width(self.config.tab_width);
+        }
+        if let Some(ws) = self.workspace.as_mut() {
+            ws.set_indent(self.config.tab_width);
         }
         self.sidebar_manual = match self.config.sidebar {
             SidebarMode::Auto => None,
@@ -761,6 +818,9 @@ impl App {
     }
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
+        // CPU frame time: how long it takes to build and submit one frame.
+        // Measured with one monotonic read at the end of the frame.
+        self.frame_started = std::time::Instant::now();
         // Read the chrome state before borrowing the GL state mutably.
         let title = self.title();
         let hover = self.hover;
@@ -833,11 +893,64 @@ impl App {
             );
         }
 
+        // F3 overlay: drawn last so it sits over everything, and skipped
+        // entirely (no work at all) when closed.
+        if self.debug {
+            let upload = r.upload_path();
+            let stats = r.stats();
+            let gpu_ms = r.gpu_ms();
+            let (version_string, renderer_string) = r.gl_strings();
+            let version_string = version_string.to_string();
+            let renderer_string = renderer_string.to_string();
+            let flags = path_flags(r.caps);
+            let info = overlay::Info {
+                cpu_ms: self.last_cpu_ms,
+                gpu_ms,
+                draw_calls: stats.draw_calls,
+                instances: stats.instances,
+                flushes: stats.flushes,
+                upload: upload.label(),
+                flags: &flags,
+                gl_version: &version_string,
+                gl_renderer: &renderer_string,
+            };
+            r.layer(crate::render::Layer::Overlay);
+            let x = (w - 330.0 - 12.0).max(layout.sidebar_w + 8.0);
+            overlay::draw(r, &palette, x, layout.title_h + 8.0, &info);
+        }
+
         r.flush();
         let _ = gl.surface.swap_buffers(&gl.context);
+        self.last_cpu_ms = self.frame_started.elapsed().as_secs_f32() * 1000.0;
         // Draw immediately, then wait for the next event.
         event_loop.set_control_flow(ControlFlow::Wait);
     }
+}
+
+/// One compact letter per optional GL path, for the F3 overlay.
+fn path_flags(caps: crate::render::caps::GlCaps) -> String {
+    let mut s = String::new();
+    if caps.safe_mode {
+        return "SAFE (all optional paths off)".to_string();
+    }
+    for (on, letter) in [
+        (caps.buffer_storage, 'B'),
+        (caps.base_instance, 'I'),
+        (caps.texture_storage, 'T'),
+        (caps.framebuffer_srgb, 'S'),
+        (caps.direct_state_access, 'D'),
+        (caps.invalidate_subdata, 'V'),
+        (caps.context_flush_control, 'F'),
+        (caps.timer_query, 'Q'),
+    ] {
+        if on {
+            s.push(letter);
+        }
+    }
+    if s.is_empty() {
+        s.push('-');
+    }
+    s
 }
 
 /// winit's resize directions, mapped from our own enum.
@@ -959,6 +1072,16 @@ impl ApplicationHandler for App {
                     }
                 }
                 // Shell shortcuts that are not editor commands.
+                if matches!(
+                    event.logical_key,
+                    winit::keyboard::Key::Named(winit::keyboard::NamedKey::F3)
+                ) {
+                    self.debug = !self.debug;
+                    if let Some(w) = self.window.as_ref() {
+                        w.request_redraw();
+                    }
+                    return;
+                }
                 if matches!(
                     event.logical_key,
                     winit::keyboard::Key::Named(winit::keyboard::NamedKey::F11)

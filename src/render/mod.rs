@@ -10,7 +10,7 @@ use glow::HasContext;
 
 use crate::render::caps::GlCaps;
 use crate::render::font::Atlas;
-use crate::render::gl::Batch;
+use crate::render::gl::{Batch, Upload};
 pub use crate::render::icons::Icon;
 use crate::render::icons::IconAtlas;
 
@@ -30,9 +30,9 @@ const TEXT_FRAG: &str = include_str!("shaders/text.frag");
 const MAX_RECTS: usize = 8192;
 const MAX_GLYPHS: usize = 32768;
 
-/// A tab advances to the next multiple of this many columns. The editor also
-/// inserts spaces for Tab (item 7), so this only matters for tabs already in a
-/// file.
+/// Default tab stop width. The `tab_width` setting can change it at runtime
+/// with `Renderer::set_tab_width`; the editor itself inserts spaces, so this
+/// only affects tabs already in a file.
 pub const TAB_COLUMNS: usize = 4;
 
 /// Paint order. Switching forces a flush, so `Background` always lands under
@@ -45,11 +45,23 @@ pub enum Layer {
     Overlay = 2,
 }
 
+/// Per-frame counters for the F3 debug overlay.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Stats {
+    /// `glDraw*` calls issued this frame.
+    pub draw_calls: u32,
+    /// Instances (rects + glyphs + icons) submitted this frame.
+    pub instances: u32,
+    /// How many times the batches had to be flushed (batching quality).
+    pub flushes: u32,
+}
+
 pub struct Renderer {
     gl: glow::Context,
-    // Read by the optional fast paths added in Phase F.
-    #[allow(dead_code)]
     pub caps: GlCaps,
+    /// Driver strings, kept for the F3 overlay.
+    gl_version: String,
+    gl_renderer: String,
     rect_program: glow::Program,
     text_program: glow::Program,
     rects: Batch,
@@ -69,6 +81,8 @@ pub struct Renderer {
     icon_bytes: Vec<u8>,
     font_px: f32,
     ui_px: f32,
+    /// Columns per tab stop (the `tab_width` setting).
+    tab_columns: usize,
     // Clip stack in physical pixels; each entry is [x, y, w, h].
     clip: Vec<[f32; 4]>,
     layer: Layer,
@@ -76,6 +90,16 @@ pub struct Renderer {
     window_w: f32,
     window_h: f32,
     window_radius: f32,
+    // Frame statistics for the debug overlay. Counting is a few increments per
+    // flush, which is free next to a draw call; the overlay itself is only
+    // drawn when it is open, so it really does cost nothing when closed.
+    stats: Stats,
+    /// GPU timer query in flight, if `ARB_timer_query` is available.
+    timer: Option<glow::Query>,
+    /// Timer state: 0 idle, 1 running, 2 ended and awaiting its result.
+    timer_state: u8,
+    /// Exact GPU frame time of the last completed frame, in milliseconds.
+    gpu_ms: Option<f32>,
 }
 
 impl Renderer {
@@ -83,16 +107,23 @@ impl Renderer {
     /// `font_px * scale` so text stays sharp on HiDPI screens.
     pub fn new(gl: glow::Context, font_bytes: &[u8], icon_bytes: &[u8], font_px: f32) -> Self {
         let caps = GlCaps::detect(&gl);
+        let (gl_version, gl_renderer) = unsafe {
+            (
+                gl.get_parameter_string(glow::VERSION),
+                gl.get_parameter_string(glow::RENDERER),
+            )
+        };
         let rect_program = gl::program(&gl, RECT_VERT, RECT_FRAG);
         let text_program = gl::program(&gl, TEXT_VERT, TEXT_FRAG);
 
         // Instance layouts must match the shaders:
         // shape: rect(4) color(4) params(4: radius, border, -, -) clip(4)
-        let rects = Batch::new(&gl, &[(1, 4), (2, 4), (3, 4), (4, 4)], MAX_RECTS);
+        let attrs: [(u32, i32); 4] = [(1, 4), (2, 4), (3, 4), (4, 4)];
+        let rects = Batch::new(&gl, &caps, &attrs, MAX_RECTS);
         // glyph: rect(4) uv(4) color(4) clip(4)
-        let glyphs = Batch::new(&gl, &[(1, 4), (2, 4), (3, 4), (4, 4)], MAX_GLYPHS);
-        let ui_glyphs = Batch::new(&gl, &[(1, 4), (2, 4), (3, 4), (4, 4)], MAX_GLYPHS);
-        let icon_glyphs = Batch::new(&gl, &[(1, 4), (2, 4), (3, 4), (4, 4)], 256);
+        let glyphs = Batch::new(&gl, &caps, &attrs, MAX_GLYPHS);
+        let ui_glyphs = Batch::new(&gl, &caps, &attrs, MAX_GLYPHS);
+        let icon_glyphs = Batch::new(&gl, &caps, &attrs, 256);
 
         let scale = 1.0;
         let ui_px = 13.0;
@@ -108,9 +139,17 @@ impl Renderer {
             gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
         }
 
+        let timer = if caps.timer_query {
+            unsafe { gl.create_query().ok() }
+        } else {
+            None
+        };
+
         Self {
             gl,
             caps,
+            gl_version,
+            gl_renderer,
             rect_program,
             text_program,
             rects,
@@ -127,12 +166,42 @@ impl Renderer {
             icon_bytes: icon_bytes.to_vec(),
             font_px,
             ui_px,
+            tab_columns: TAB_COLUMNS,
             clip: Vec::new(),
             layer: Layer::Background,
             window_w: 1.0,
             window_h: 1.0,
             window_radius: 0.0,
+            stats: Stats::default(),
+            timer,
+            timer_state: 0,
+            gpu_ms: None,
         }
+    }
+
+    /// Driver description for the debug overlay: version and renderer string.
+    pub fn gl_strings(&self) -> (&str, &str) {
+        (&self.gl_version, &self.gl_renderer)
+    }
+
+    /// Which instance-upload path the batches actually use.
+    pub fn upload_path(&self) -> Upload {
+        self.rects.upload()
+    }
+
+    /// Statistics for the last completed frame.
+    pub fn stats(&self) -> Stats {
+        self.stats
+    }
+
+    /// Exact GPU time of the last completed frame, when timer queries work.
+    pub fn gpu_ms(&self) -> Option<f32> {
+        self.gpu_ms
+    }
+
+    /// Set the tab stop width in columns (2, 4 or 8 from the settings page).
+    pub fn set_tab_width(&mut self, columns: usize) {
+        self.tab_columns = columns.clamp(1, 32);
     }
 
     /// Size of one editor character cell in points: (width, height).
@@ -199,7 +268,31 @@ impl Renderer {
             self.window_w = self.width;
             self.window_h = self.height;
         }
+        self.stats = Stats::default();
         unsafe {
+            // One query at a time: collect the previous result when it has
+            // arrived, then start timing this frame.
+            if let Some(q) = self.timer {
+                if self.timer_state == 2
+                    && self
+                        .gl
+                        .get_query_parameter_u32(q, glow::QUERY_RESULT_AVAILABLE)
+                        != 0
+                {
+                    let ns = self.gl.get_query_parameter_u64(q, glow::QUERY_RESULT);
+                    // A query that was never really timed can report garbage
+                    // (older drivers do this for the first frame). Anything
+                    // over a second is not a frame, so keep the previous value.
+                    if ns <= 1_000_000_000 {
+                        self.gpu_ms = Some(ns as f32 / 1_000_000.0);
+                    }
+                    self.timer_state = 0;
+                }
+                if self.timer_state == 0 {
+                    self.gl.begin_query(glow::TIME_ELAPSED, q);
+                    self.timer_state = 1;
+                }
+            }
             self.gl.viewport(0, 0, w as i32, h as i32);
             // Transparent clear: the shell draws its own rounded background,
             // and the compositor shows the desktop outside that shape.
@@ -376,6 +469,7 @@ impl Renderer {
             &self.atlas,
             &mut self.glyphs,
             self.scale,
+            self.tab_columns,
             x,
             y,
             s,
@@ -392,6 +486,7 @@ impl Renderer {
             &self.ui_atlas,
             &mut self.ui_glyphs,
             self.scale,
+            self.tab_columns,
             x,
             y,
             s,
@@ -415,7 +510,7 @@ impl Renderer {
         let mut c = 0usize;
         for ch in line.chars().take(col) {
             if ch == '\t' {
-                let next = (c / TAB_COLUMNS + 1) * TAB_COLUMNS;
+                let next = (c / self.tab_columns + 1) * self.tab_columns;
                 pen += (next - c) as f32 * cell_w;
                 c = next;
             } else {
@@ -445,6 +540,7 @@ impl Renderer {
         {
             return;
         }
+        self.stats.flushes += 1;
         unsafe {
             self.gl.use_program(Some(self.text_program));
             self.set_common_uniforms(self.text_program);
@@ -455,17 +551,20 @@ impl Renderer {
             if !self.glyphs.data.is_empty() {
                 self.gl
                     .bind_texture(glow::TEXTURE_2D, Some(self.atlas.texture));
-                self.glyphs.draw(&self.gl);
+                self.stats.instances += self.glyphs.len() as u32;
+                self.stats.draw_calls += self.glyphs.draw(&self.gl);
             }
             if !self.ui_glyphs.data.is_empty() {
                 self.gl
                     .bind_texture(glow::TEXTURE_2D, Some(self.ui_atlas.texture));
-                self.ui_glyphs.draw(&self.gl);
+                self.stats.instances += self.ui_glyphs.len() as u32;
+                self.stats.draw_calls += self.ui_glyphs.draw(&self.gl);
             }
             if !self.icon_glyphs.data.is_empty() {
                 self.gl
                     .bind_texture(glow::TEXTURE_2D, Some(self.icon_atlas.texture));
-                self.icon_glyphs.draw(&self.gl);
+                self.stats.instances += self.icon_glyphs.len() as u32;
+                self.stats.draw_calls += self.icon_glyphs.draw(&self.gl);
             }
             self.gl.bind_texture(glow::TEXTURE_2D, None);
         }
@@ -474,10 +573,12 @@ impl Renderer {
     /// Shapes first, then glyphs: the normal paint order within a layer.
     fn flush_batches(&mut self) {
         if !self.rects.data.is_empty() {
+            self.stats.flushes += 1;
+            self.stats.instances += self.rects.len() as u32;
             unsafe {
                 self.gl.use_program(Some(self.rect_program));
                 self.set_common_uniforms(self.rect_program);
-                self.rects.draw(&self.gl);
+                self.stats.draw_calls += self.rects.draw(&self.gl);
             }
         }
         self.flush_text();
@@ -500,6 +601,29 @@ impl Renderer {
     pub fn flush(&mut self) {
         self.flush_batches();
         self.clip.clear();
+        // Close the timer query for this frame and pick up the result of an
+        // older one. The result is only read when it is already available, so
+        // this never stalls the CPU waiting for the GPU.
+        unsafe {
+            if self.timer_state == 1 {
+                self.gl.end_query(glow::TIME_ELAPSED);
+                self.timer_state = 2;
+            }
+        }
+    }
+}
+
+impl Drop for Renderer {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(q) = self.timer.take() {
+                self.gl.delete_query(q);
+            }
+        }
+        self.rects.destroy(&self.gl);
+        self.glyphs.destroy(&self.gl);
+        self.ui_glyphs.destroy(&self.gl);
+        self.icon_glyphs.destroy(&self.gl);
     }
 }
 
@@ -517,6 +641,7 @@ fn queue_text(
     atlas: &Atlas,
     batch: &mut Batch,
     scale: f32,
+    tab_columns: usize,
     x: f32,
     y: f32,
     s: &str,
@@ -530,7 +655,7 @@ fn queue_text(
     for ch in s.chars() {
         // A tab advances to the next tab stop instead of drawing a glyph.
         if ch == '\t' {
-            let next = (col / TAB_COLUMNS + 1) * TAB_COLUMNS;
+            let next = (col / tab_columns + 1) * tab_columns;
             pen += (next - col) as f32 * cell_w;
             col = next;
             continue;

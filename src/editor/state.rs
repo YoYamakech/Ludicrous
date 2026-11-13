@@ -14,7 +14,8 @@ use crate::editor::history::{Edit, EditKind, History};
 /// again.
 const QUIT_ARM_WINDOW: Duration = Duration::from_secs(3);
 
-/// One indent level, in spaces. Change this one number to change the style.
+/// Default indent level, in spaces. The settings page can change it per run
+/// (`Editor::set_indent`) without touching this value.
 pub const INDENT_WIDTH: usize = 4;
 
 /// What the app should do after a command has been applied.
@@ -48,6 +49,8 @@ pub struct Editor {
     /// Where a shift-selection started. `None` means nothing is selected; the
     /// selection is always the range between this and the cursor.
     pub anchor: Option<Cursor>,
+    /// Spaces per indent level (the `tab_width` setting).
+    indent: usize,
 }
 
 impl Editor {
@@ -63,7 +66,14 @@ impl Editor {
             quit_armed: None,
             history: History::new(),
             anchor: None,
+            indent: INDENT_WIDTH,
         }
+    }
+
+    /// Set how many spaces one indent level is. Tab, Shift+Tab, auto-indent
+    /// and the soft-tab insert all follow it.
+    pub fn set_indent(&mut self, width: usize) {
+        self.indent = width.max(1);
     }
 
     /// The selected range as `(start, end)` character indices, or `None` when
@@ -196,14 +206,14 @@ impl Editor {
         // recorded position is still valid at the moment it is used.
         for line in first..=last {
             let pos = self.buffer.char_index(line, 0);
-            let text = " ".repeat(INDENT_WIDTH);
+            let text = " ".repeat(self.indent);
             self.buffer.insert_str_at(pos, &text);
             edits.push(Edit::Insert { pos, text });
         }
         // Keep the selection covering the same text.
-        self.cursor.col += INDENT_WIDTH;
+        self.cursor.col += self.indent;
         if let Some(a) = self.anchor.as_mut() {
-            a.col += INDENT_WIDTH;
+            a.col += self.indent;
         }
         self.history.record_entry(edits, before, self.cursor);
         self.sync_modified();
@@ -215,7 +225,7 @@ impl Editor {
         let line = self.cursor.line;
         let text = self.buffer.line(line);
         let spaces = text.chars().take_while(|c| *c == ' ').count();
-        let remove = spaces.min(INDENT_WIDTH);
+        let remove = spaces.min(self.indent);
         if remove == 0 {
             return;
         }
@@ -334,7 +344,7 @@ impl Editor {
                     .take_while(|c| *c == ' ' || *c == '\t')
                     .collect();
                 let extra = if line.trim_end().ends_with('{') {
-                    " ".repeat(INDENT_WIDTH)
+                    " ".repeat(self.indent)
                 } else {
                     String::new()
                 };
@@ -362,7 +372,7 @@ impl Editor {
                     return Control::Continue;
                 }
                 let col = self.cursor.col;
-                let spaces = INDENT_WIDTH - (col % INDENT_WIDTH);
+                let spaces = self.indent - (col % self.indent);
                 self.insert_text(&" ".repeat(spaces));
             }
             Command::Unindent => {
@@ -923,6 +933,28 @@ mod tests {
         ed.apply(Command::Undo);
         assert_eq!(ed.buffer.line(0), "a");
         assert_eq!(ed.buffer.line(1), "b");
+    }
+
+    #[test]
+    fn tab_width_setting_drives_every_indent_path() {
+        let mut ed = editor("a");
+        ed.set_indent(2);
+        ed.apply(Command::Tab);
+        assert_eq!(ed.buffer.line(0), "  a");
+        // A second Tab at column 2 goes to the next stop, so still two spaces.
+        ed.apply(Command::Tab);
+        assert_eq!(ed.buffer.line(0), "    a");
+        ed.apply(Command::Unindent);
+        assert_eq!(ed.buffer.line(0), "  a");
+        // Auto-indent copies the leading whitespace, whatever the width is:
+        // newline at column 2 of "  a" splits it and keeps the indent.
+        ed.set_indent(8);
+        ed.apply(Command::Newline);
+        assert_eq!(ed.buffer.line(1), "  a");
+        // A Tab at column 2 now goes to the next stop at 8, so six spaces.
+        ed.apply(Command::Tab);
+        assert_eq!(ed.buffer.line(1), "        a");
+        assert_eq!(ed.cursor.col, 8);
     }
 
     #[test]

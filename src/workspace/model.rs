@@ -20,6 +20,9 @@ pub struct Workspace {
     /// parallel to `buffers` so quitting with several dirty files asks about
     /// each one in turn instead of losing them silently.
     quit_ok: Vec<bool>,
+    /// Spaces per indent level, applied to every buffer including ones opened
+    /// after the setting changed.
+    indent: usize,
 }
 
 /// What happened when a file was opened. The app uses this to decide whether
@@ -41,6 +44,7 @@ impl Workspace {
             active: 0,
             tree: FileTree::new(),
             quit_ok: vec![false],
+            indent: crate::editor::state::INDENT_WIDTH,
         }
     }
 
@@ -72,6 +76,22 @@ impl Workspace {
         self.buffers.get_mut(self.active)
     }
 
+    /// Set the indent width for every buffer, now and for ones opened later.
+    pub fn set_indent(&mut self, width: usize) {
+        self.indent = width.max(1);
+        for b in self.buffers.iter_mut() {
+            b.set_indent(self.indent);
+        }
+    }
+
+    /// A new editor that already follows `self.indent`, so a file opened after
+    /// the tab-width setting changed gets the same indentation.
+    fn new_editor(&self, buffer: Buffer) -> Editor {
+        let mut ed = Editor::new(buffer);
+        ed.set_indent(self.indent);
+        ed
+    }
+
     /// True when any buffer has unsaved changes; feeds the quit guard.
     pub fn any_dirty(&self) -> bool {
         self.buffers.iter().any(|b| b.is_dirty())
@@ -98,12 +118,13 @@ impl Workspace {
             && self.buffers[0].is_pristine()
             && self.buffers[0].path().is_none()
         {
-            self.buffers[0] = Editor::new(buffer);
+            self.buffers[0] = self.new_editor(buffer);
             self.quit_ok[0] = false;
             self.active = 0;
             return Ok(OpenResult::Opened(0));
         }
-        self.buffers.push(Editor::new(buffer));
+        let ed = self.new_editor(buffer);
+        self.buffers.push(ed);
         self.quit_ok.push(false);
         self.active = self.buffers.len() - 1;
         Ok(OpenResult::Opened(self.active))
@@ -151,7 +172,8 @@ impl Workspace {
         }
         if self.buffers.is_empty() {
             // Never leave the window without an editor: keep one empty buffer.
-            self.buffers.push(Editor::new(Buffer::empty()));
+            let ed = self.new_editor(Buffer::empty());
+            self.buffers.push(ed);
             self.quit_ok.push(false);
             self.active = 0;
         } else if self.active >= self.buffers.len() {

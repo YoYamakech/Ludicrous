@@ -49,6 +49,11 @@ pub struct Config {
     pub corner_radius: u32,
     pub sidebar: SidebarMode,
     pub theme: Theme,
+    /// Experimental: ask the window system for the damaged region instead of
+    /// redrawing the whole window. Off by default (section 9.1: with a
+    /// transparent, premultiplied window partial redraws are easy to get
+    /// wrong). Not exposed on the settings page, which has eight fixed rows.
+    pub experimental_damage: bool,
 }
 
 impl Default for Config {
@@ -62,6 +67,7 @@ impl Default for Config {
             corner_radius: 10,
             sidebar: SidebarMode::Auto,
             theme: Theme::Dark,
+            experimental_damage: false,
         }
     }
 }
@@ -167,6 +173,11 @@ impl Config {
                 "light" => self.theme = Theme::Light,
                 _ => {}
             },
+            "experimental_damage" => {
+                if let Some(v) = parse_bool(value) {
+                    self.experimental_damage = v;
+                }
+            }
             _ => {} // unknown keys are forward compatible by design
         }
     }
@@ -183,7 +194,8 @@ impl Config {
              window_buttons = {}\n\
              corner_radius = {}\n\
              sidebar = {}\n\
-             theme = {}\n",
+             theme = {}\n\
+             experimental_damage = {}\n",
             self.font_size,
             self.tab_width,
             self.show_line_numbers,
@@ -203,6 +215,7 @@ impl Config {
                 Theme::Dark => "dark",
                 Theme::Light => "light",
             },
+            self.experimental_damage,
         )
     }
 
@@ -266,6 +279,9 @@ pub struct WindowState {
     pub width: f32,
     pub height: f32,
     pub maximized: bool,
+    /// The sidebar mode actually showing when the window closed. `None` means
+    /// "no manual choice", which is also what `auto` in the config uses.
+    pub sidebar: Option<SidebarMode>,
 }
 
 impl Default for WindowState {
@@ -275,6 +291,7 @@ impl Default for WindowState {
             width: 1100.0,
             height: 700.0,
             maximized: false,
+            sidebar: None,
         }
     }
 }
@@ -288,9 +305,15 @@ impl WindowState {
         let Some(path) = Self::path() else {
             return Self::default();
         };
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            return Self::default();
-        };
+        match std::fs::read_to_string(&path) {
+            Ok(text) => Self::parse(&text),
+            Err(_) => Self::default(),
+        }
+    }
+
+    /// Parse the state file. Missing lines keep their defaults, garbage is
+    /// ignored, and out-of-range sizes are rejected.
+    pub fn parse(text: &str) -> Self {
         let mut st = Self::default();
         for line in text.lines() {
             let line = line.split('#').next().unwrap_or("").trim();
@@ -298,43 +321,64 @@ impl WindowState {
                 continue;
             };
             let value = value.trim();
-            match key.trim() {
-                "width" => {
-                    // Only accept a sane size: a broken value must not create a
-                    // window smaller than the minimum.
-                    if let Ok(v) = value.parse::<f32>() {
-                        if (480.0..=16384.0).contains(&v) {
-                            st.width = v;
-                        }
-                    }
-                }
-                "height" => {
-                    if let Ok(v) = value.parse::<f32>() {
-                        if (320.0..=16384.0).contains(&v) {
-                            st.height = v;
-                        }
-                    }
-                }
-                "maximized" => {
-                    if let Some(v) = parse_bool(value) {
-                        st.maximized = v;
-                    }
-                }
-                _ => {}
-            }
+            let key = key.trim();
+            st.set(key, value);
         }
         st
+    }
+
+    fn set(&mut self, key: &str, value: &str) {
+        match key {
+            // Only accept a sane size: a broken value must not create a window
+            // smaller than the minimum.
+            "width" => {
+                if let Ok(v) = value.parse::<f32>() {
+                    if (480.0..=16384.0).contains(&v) {
+                        self.width = v;
+                    }
+                }
+            }
+            "height" => {
+                if let Ok(v) = value.parse::<f32>() {
+                    if (320.0..=16384.0).contains(&v) {
+                        self.height = v;
+                    }
+                }
+            }
+            "maximized" => {
+                if let Some(v) = parse_bool(value) {
+                    self.maximized = v;
+                }
+            }
+            "sidebar" => {
+                self.sidebar = match value {
+                    "expanded" => Some(SidebarMode::Expanded),
+                    "rail" => Some(SidebarMode::Rail),
+                    "hidden" => Some(SidebarMode::Hidden),
+                    _ => None, // auto, or garbage: fall back to the config
+                };
+            }
+            _ => {}
+        }
     }
 
     pub fn save(&self) {
         let Some(path) = Self::path() else {
             return;
         };
+        let sidebar = match self.sidebar {
+            None => "auto",
+            Some(SidebarMode::Auto) => "auto",
+            Some(SidebarMode::Expanded) => "expanded",
+            Some(SidebarMode::Rail) => "rail",
+            Some(SidebarMode::Hidden) => "hidden",
+        };
         let text = format!(
-            "# Ludicrous window state\nwidth = {}\nheight = {}\nmaximized = {}\n",
+            "# Ludicrous window state\nwidth = {}\nheight = {}\nmaximized = {}\nsidebar = {}\n",
             self.width.round() as i64,
             self.height.round() as i64,
-            self.maximized
+            self.maximized,
+            sidebar
         );
         if let Err(e) = safe_write(&path, &text) {
             eprintln!("ludicrous: could not save window state: {e}");
@@ -370,6 +414,7 @@ mod tests {
             corner_radius: 14,
             sidebar: SidebarMode::Rail,
             theme: Theme::Light,
+            experimental_damage: true,
         };
         assert_eq!(Config::parse(&c.to_text()), c);
     }
@@ -411,6 +456,28 @@ mod tests {
         for no in ["false", "off", "0", "no"] {
             assert!(!Config::parse(&format!("show_line_numbers = {no}")).show_line_numbers);
         }
+    }
+
+    #[test]
+    fn experimental_damage_is_off_unless_asked_for() {
+        assert!(!Config::default().experimental_damage);
+        assert!(Config::parse("experimental_damage = true").experimental_damage);
+        assert!(!Config::parse("experimental_damage = maybe").experimental_damage);
+    }
+
+    #[test]
+    fn window_state_sidebar_round_trips() {
+        let st = WindowState::parse("width = 900\nheight = 600\nsidebar = rail # last run\n");
+        assert_eq!(st.width, 900.0);
+        assert_eq!(st.height, 600.0);
+        assert_eq!(st.sidebar, Some(SidebarMode::Rail));
+        assert_eq!(WindowState::default().sidebar, None);
+        assert_eq!(WindowState::parse("sidebar = auto").sidebar, None);
+        assert_eq!(WindowState::parse("sidebar = nonsense").sidebar, None);
+        // Garbage sizes fall back to the sane defaults.
+        let bad = WindowState::parse("width = 5\nheight = 1e9\n");
+        assert_eq!(bad.width, WindowState::default().width);
+        assert_eq!(bad.height, WindowState::default().height);
     }
 
     #[test]
