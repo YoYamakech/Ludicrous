@@ -297,3 +297,16 @@ struct HistoryEntry {
 ## Still on the later list
 
 Syntax highlighting, a build/run command with a panel that jumps to compiler errors, search, tabs, a file tree, and clangd integration. Do not start these during v1.1.
+
+
+---
+
+# Cross-cutting rule: mouse cursor icons
+
+The mouse cursor is **computed from where the pointer is**, never set ad hoc.
+
+- The UI builds a `HitMap` (regions in front-to-back order, each with a rect, a clip rect, a `CursorKind`, and a click target). Clicks, hover highlights, and the cursor all read the **same** map.
+- `ui/cursor.rs::resolve(pos, hitmap, window_state)` returns a `CursorKind`: **Default** (arrow) on non-clickable areas, **Pointer** (hand) on clickable items, **Text** (I-beam) only in the editor text area, and resize cursors on window edges.
+- `app.rs` maps `CursorKind` to the windowing library's cursor type and calls `set_cursor` **only when the kind changes**.
+- Re-resolve on mouse move and also whenever layout changes under a still pointer (scrolling, animations, opening or closing panels).
+- Details and acceptance checks are in `LUDICROUS_V1.2_SPEC.md`, section 3b. This rule applies to every new clickable element: if it is clickable, it registers a region.
