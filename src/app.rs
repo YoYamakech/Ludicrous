@@ -11,18 +11,20 @@ use glutin::display::{GetGlDisplay, GlDisplay};
 use glutin::surface::{GlSurface, Surface, SurfaceAttributesBuilder, SwapInterval, WindowSurface};
 use glutin_winit::DisplayBuilder;
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
+use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::keyboard::ModifiersState;
 use winit::raw_window_handle::HasWindowHandle;
-use winit::window::{Window, WindowId};
+use winit::window::{CursorIcon, Fullscreen, Window, WindowId};
 
 use crate::editor::{Buffer, Command, Control, Editor};
 use crate::input;
 use crate::render::Renderer;
 use crate::ui::layout::Layout;
+use crate::ui::theme;
 use crate::ui::view;
+use crate::window::{self, Hit, HitState, ResizeDirection, WindowButton};
 
 // The font is compiled into the binary: no file lookup at startup, no missing
 // font on a fresh machine.
@@ -45,7 +47,14 @@ pub struct App {
     /// would slow cold start and can fail on a headless machine.
     clipboard: Option<arboard::Clipboard>,
     /// Last mouse position in physical pixels, for click-to-place-cursor.
-    cursor_pos: Option<winit::dpi::PhysicalPosition<f64>>,
+    cursor_pos: Option<PhysicalPosition<f64>>,
+    /// What the mouse is over, so hover feedback only redraws on change.
+    hover: Option<Hit>,
+    /// Sidebar mode. `None` means "auto" (collapse on narrow windows).
+    sidebar_manual: Option<bool>,
+    /// True when the GL config actually has an alpha channel. Without it the
+    /// window is opaque and square, and we say so once at startup.
+    transparent: bool,
 }
 
 impl App {
@@ -58,6 +67,9 @@ impl App {
             mods: ModifiersState::empty(),
             clipboard: None,
             cursor_pos: None,
+            hover: None,
+            sidebar_manual: None,
+            transparent: false,
         }
     }
 
@@ -119,18 +131,37 @@ impl App {
         &mut self,
         event_loop: &ActiveEventLoop,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // The shell draws its own title bar and rounded corners, so the OS
+        // decorations are off and the window is transparent where the rounded
+        // shape does not cover it.
         let attributes = Window::default_attributes()
             .with_title("Ludicrous")
-            .with_inner_size(LogicalSize::new(1000.0, 660.0));
+            .with_inner_size(LogicalSize::new(1000.0, 660.0))
+            .with_min_inner_size(LogicalSize::new(theme::MIN_W, theme::MIN_H))
+            .with_decorations(false)
+            .with_transparent(true);
 
-        let template = ConfigTemplateBuilder::new().with_alpha_size(8);
+        // Ask for an alpha channel and transparency. If the driver cannot do
+        // it we still start: the window is then opaque and square.
+        let template = ConfigTemplateBuilder::new()
+            .with_alpha_size(8)
+            .with_transparency(true);
         let (window, gl_config) = DisplayBuilder::new()
             .with_window_attributes(Some(attributes))
             .build(event_loop, template, |configs| {
-                // Pick the config with the most samples; simple and good enough.
+                // Prefer a config that really supports transparency, then the
+                // one with the most samples.
                 configs
                     .reduce(|best, c| {
-                        if c.num_samples() > best.num_samples() {
+                        let best_t = best.supports_transparency().unwrap_or(false);
+                        let c_t = c.supports_transparency().unwrap_or(false);
+                        if c_t != best_t {
+                            if c_t {
+                                c
+                            } else {
+                                best
+                            }
+                        } else if c.num_samples() > best.num_samples() {
                             c
                         } else {
                             best
@@ -139,6 +170,10 @@ impl App {
                     .expect("no GL configs available")
             })?;
         let window = window.expect("no window created");
+        self.transparent = gl_config.supports_transparency().unwrap_or(false);
+        if !self.transparent {
+            eprintln!("ludicrous: no transparent GL config; using an opaque square window");
+        }
 
         let size = window.inner_size();
         let (w, h) = (
@@ -203,6 +238,25 @@ impl App {
         Ok(())
     }
 
+    /// Sidebar width in points for a window of `w` points.
+    ///
+    /// Auto mode collapses to a rail under 900 px and hides under 600 px. A
+    /// manual Ctrl+B toggle wins until the window is resized across one of
+    /// those thresholds (see `on_resize`).
+    fn sidebar_width(&self, w: f32) -> f32 {
+        let expanded = match self.sidebar_manual {
+            Some(show) => show,
+            None => w >= 900.0,
+        };
+        if expanded {
+            theme::SIDEBAR_W
+        } else if w >= 600.0 {
+            theme::SIDEBAR_RAIL_W
+        } else {
+            0.0
+        }
+    }
+
     /// Build the current layout from the window size. Used by both drawing and
     /// hit testing, so a click always lands where the text was drawn.
     fn layout(&self) -> Option<Layout> {
@@ -212,10 +266,109 @@ impl App {
         let size = window.inner_size();
         let scale = window.scale_factor() as f32;
         let (w, h) = (size.width as f32 / scale, size.height as f32 / scale);
-        Some(Layout::new(&gl.renderer, ed.buffer.line_count(), w, h))
+        Some(Layout::new(
+            &gl.renderer,
+            ed.buffer.line_count(),
+            w,
+            h,
+            self.sidebar_width(w),
+        ))
+    }
+
+    /// Title text for the title bar.
+    fn title(&self) -> String {
+        let Some(ed) = self.editor.as_ref() else {
+            return "Ludicrous".to_string();
+        };
+        match &ed.buffer.path {
+            Some(p) => {
+                let name = p
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("[No Name]");
+                format!("Ludicrous: {name}")
+            }
+            None => "Ludicrous".to_string(),
+        }
+    }
+
+    fn hit_state(&self) -> HitState {
+        let maximized = self
+            .window
+            .as_ref()
+            .map(|w| w.is_maximized())
+            .unwrap_or(false);
+        let fullscreen = self
+            .window
+            .as_ref()
+            .map(|w| w.fullscreen().is_some())
+            .unwrap_or(false);
+        HitState {
+            maximized,
+            fullscreen,
+            buttons_left: false,
+        }
+    }
+
+    /// What is under the last known cursor position, in points.
+    fn hit_at_cursor(&self) -> Option<Hit> {
+        let pos = self.cursor_pos?;
+        let window = self.window.as_ref()?;
+        let scale = window.scale_factor() as f32;
+        let size = window.inner_size();
+        let (w, h) = (size.width as f32 / scale, size.height as f32 / scale);
+        Some(window::hit_test(
+            window::to_points(pos, scale),
+            (w, h),
+            self.hit_state(),
+        ))
+    }
+
+    /// Update the OS cursor icon for the current hover target.
+    fn update_cursor_icon(&self) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let icon = match self.hover {
+            Some(Hit::Resize(dir)) => Some(match dir {
+                ResizeDirection::North | ResizeDirection::South => CursorIcon::NsResize,
+                ResizeDirection::East | ResizeDirection::West => CursorIcon::EwResize,
+                ResizeDirection::NorthEast | ResizeDirection::SouthWest => CursorIcon::NeswResize,
+                ResizeDirection::NorthWest | ResizeDirection::SouthEast => CursorIcon::NwseResize,
+            }),
+            Some(Hit::TitleDrag) => Some(CursorIcon::Default),
+            _ => Some(CursorIcon::Text),
+        };
+        window.set_cursor(icon.unwrap_or(CursorIcon::Default));
+    }
+
+    /// Toggle the sidebar, remembering the choice until the next resize across
+    /// a breakpoint.
+    fn toggle_sidebar(&mut self) {
+        let w = self
+            .window
+            .as_ref()
+            .map(|win| {
+                let s = win.scale_factor() as f32;
+                win.inner_size().width as f32 / s
+            })
+            .unwrap_or(1000.0);
+        let expanded = self.sidebar_width(w) >= theme::SIDEBAR_W;
+        self.sidebar_manual = Some(!expanded);
     }
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
+        // Read the chrome state before borrowing the GL state mutably.
+        let title = self.title();
+        let hover = self.hover;
+        let sidebar_w = self
+            .window
+            .as_ref()
+            .map(|w| {
+                let s = w.scale_factor() as f32;
+                self.sidebar_width(w.inner_size().width as f32 / s)
+            })
+            .unwrap_or(0.0);
         let (Some(window), Some(gl), Some(ed)) =
             (self.window.as_ref(), self.gl.as_mut(), self.editor.as_mut())
         else {
@@ -229,14 +382,35 @@ impl App {
 
         // Layout works in points; the renderer scales internally.
         let (w, h) = (size.width as f32 / scale, size.height as f32 / scale);
-        let layout = Layout::new(r, ed.buffer.line_count(), w, h);
+        let layout = Layout::new(r, ed.buffer.line_count(), w, h, sidebar_w);
         ed.ensure_visible(layout.rows, layout.cols);
-        view::draw(r, ed, &layout);
+        let chrome = view::Chrome {
+            title: &title,
+            modified: ed.is_dirty(),
+            maximized: window.is_maximized(),
+            hover,
+        };
+        view::draw(r, ed, &layout, &chrome);
 
         r.flush();
         let _ = gl.surface.swap_buffers(&gl.context);
         // Draw immediately, then wait for the next event.
         event_loop.set_control_flow(ControlFlow::Wait);
+    }
+}
+
+/// winit's resize directions, mapped from our own enum.
+fn resize_edge(dir: ResizeDirection) -> winit::window::ResizeDirection {
+    use winit::window::ResizeDirection as W;
+    match dir {
+        ResizeDirection::North => W::North,
+        ResizeDirection::South => W::South,
+        ResizeDirection::East => W::East,
+        ResizeDirection::West => W::West,
+        ResizeDirection::NorthEast => W::NorthEast,
+        ResizeDirection::NorthWest => W::NorthWest,
+        ResizeDirection::SouthEast => W::SouthEast,
+        ResizeDirection::SouthWest => W::SouthWest,
     }
 }
 
@@ -270,6 +444,32 @@ impl ApplicationHandler for App {
                 if event.state != ElementState::Pressed {
                     return;
                 }
+                // Shell shortcuts that are not editor commands.
+                if matches!(
+                    event.logical_key,
+                    winit::keyboard::Key::Named(winit::keyboard::NamedKey::F11)
+                ) {
+                    if let Some(w) = self.window.as_ref() {
+                        let next = if w.fullscreen().is_some() {
+                            None
+                        } else {
+                            Some(Fullscreen::Borderless(None))
+                        };
+                        w.set_fullscreen(next);
+                        w.request_redraw();
+                    }
+                    return;
+                }
+                if self.mods.control_key()
+                    && matches!(&event.logical_key,
+                        winit::keyboard::Key::Character(c) if c.as_str().eq_ignore_ascii_case("b"))
+                {
+                    self.toggle_sidebar();
+                    if let Some(w) = self.window.as_ref() {
+                        w.request_redraw();
+                    }
+                    return;
+                }
                 // Clipboard commands need the app, not just the editor.
                 if input::is_paste(&event, self.mods) {
                     self.paste();
@@ -300,31 +500,96 @@ impl ApplicationHandler for App {
                 if state != ElementState::Pressed || button != MouseButton::Left {
                     return;
                 }
-                let Some(pos) = self.cursor_pos else {
+                let Some(hit) = self.hit_at_cursor() else {
                     return;
                 };
-                let Some(layout) = self.layout() else {
-                    return;
-                };
-                let Some(ed) = self.editor.as_mut() else {
-                    return;
-                };
-                let scale = self
-                    .window
-                    .as_ref()
-                    .map(|w| w.scale_factor() as f32)
-                    .unwrap_or(1.0);
-                let (x, y) = (pos.x as f32 / scale, pos.y as f32 / scale);
-                // Clicks outside the text area (gutter, status bar) do nothing.
-                if let Some((line, col)) = layout.text_position(x, y, ed.scroll, ed.scroll_x) {
-                    ed.apply(Command::Click { line, col });
-                    if let Some(w) = self.window.as_ref() {
-                        w.request_redraw();
+                match hit {
+                    Hit::Resize(dir) => {
+                        if let Some(w) = self.window.as_ref() {
+                            let _ = w.drag_resize_window(resize_edge(dir));
+                        }
+                    }
+                    Hit::TitleDrag => {
+                        if let Some(w) = self.window.as_ref() {
+                            let _ = w.drag_window();
+                        }
+                    }
+                    Hit::SidebarToggle => {
+                        self.toggle_sidebar();
+                        if let Some(w) = self.window.as_ref() {
+                            w.request_redraw();
+                        }
+                    }
+                    Hit::Button(WindowButton::Minimize) => {
+                        if let Some(w) = self.window.as_ref() {
+                            w.set_minimized(true);
+                        }
+                    }
+                    Hit::Button(WindowButton::Maximize) => {
+                        if let Some(w) = self.window.as_ref() {
+                            w.set_maximized(!w.is_maximized());
+                        }
+                    }
+                    Hit::Button(WindowButton::Close) => {
+                        // Same guard as Ctrl+Q and the OS close request.
+                        let quit = match self.editor.as_mut() {
+                            Some(ed) => ed.request_quit() == Control::Quit,
+                            None => true,
+                        };
+                        if quit {
+                            event_loop.exit();
+                        } else if let Some(w) = self.window.as_ref() {
+                            w.request_redraw();
+                        }
+                    }
+                    Hit::Content => {
+                        let Some(layout) = self.layout() else {
+                            return;
+                        };
+                        let Some(ed) = self.editor.as_mut() else {
+                            return;
+                        };
+                        let scale = self
+                            .window
+                            .as_ref()
+                            .map(|w| w.scale_factor() as f32)
+                            .unwrap_or(1.0);
+                        let Some(pos) = self.cursor_pos else {
+                            return;
+                        };
+                        let (x, y) = window::to_points(pos, scale);
+                        // Clicks outside the text area (gutter, status bar) do
+                        // nothing.
+                        if let Some((line, col)) =
+                            layout.text_position(x, y, ed.scroll, ed.scroll_x)
+                        {
+                            ed.apply(Command::Click { line, col });
+                            if let Some(w) = self.window.as_ref() {
+                                w.request_redraw();
+                            }
+                        }
                     }
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = Some(position);
+                // Hover feedback: only redraw when the target actually changes.
+                let hit = self.hit_at_cursor();
+                if hit != self.hover {
+                    self.hover = hit;
+                    self.update_cursor_icon();
+                    if let Some(w) = self.window.as_ref() {
+                        w.request_redraw();
+                    }
+                }
+            }
+            WindowEvent::CursorLeft { .. } => {
+                if self.hover.is_some() {
+                    self.hover = None;
+                    if let Some(w) = self.window.as_ref() {
+                        w.request_redraw();
+                    }
+                }
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 // Convert pixel deltas to lines using the current cell height.
@@ -348,6 +613,17 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::Resized(size) => {
+                // A manual sidebar toggle only lasts until the window is
+                // resized across one of the auto-collapse thresholds.
+                let scale = self
+                    .window
+                    .as_ref()
+                    .map(|w| w.scale_factor() as f32)
+                    .unwrap_or(1.0);
+                let w_pts = size.width as f32 / scale;
+                if w_pts < 600.0 || w_pts >= 900.0 {
+                    self.sidebar_manual = None;
+                }
                 if let Some(gl) = self.gl.as_mut() {
                     if let (Some(w), Some(h)) =
                         (NonZeroU32::new(size.width), NonZeroU32::new(size.height))

@@ -5,36 +5,186 @@
 use crate::editor::Editor;
 use crate::render::Renderer;
 use crate::ui::layout::Layout;
-
-// Hard-coded dark theme for v1. "Ugly but readable" is the brief.
-pub mod theme {
-    use crate::render::Color;
-
-    pub const BACKGROUND: Color = [0.09, 0.10, 0.12, 1.0];
-    pub const GUTTER_BG: Color = [0.12, 0.13, 0.15, 1.0];
-    pub const GUTTER_TEXT: Color = [0.38, 0.41, 0.47, 1.0];
-    pub const TEXT: Color = [0.86, 0.88, 0.90, 1.0];
-    pub const CURSOR: Color = [0.95, 0.70, 0.30, 1.0];
-    pub const STATUS_BG: Color = [0.16, 0.18, 0.21, 1.0];
-    pub const STATUS_TEXT: Color = [0.72, 0.76, 0.82, 1.0];
-    pub const MODIFIED: Color = [0.95, 0.70, 0.30, 1.0];
-    pub const ERROR: Color = [0.95, 0.45, 0.40, 1.0];
-    pub const SELECTION: Color = [0.20, 0.32, 0.48, 1.0];
-}
+use crate::ui::theme;
+use crate::window::{Hit, WindowButton};
 
 const GUTTER_PAD: f32 = 8.0;
 const CURSOR_W: f32 = 2.0;
 
-pub fn draw(r: &mut Renderer, ed: &Editor, l: &Layout) {
-    // Background for the whole window, then the gutter band.
-    r.rect(0.0, 0.0, l.width, l.height, theme::BACKGROUND);
-    let body_h = l.height - l.status_h;
-    r.rect(0.0, 0.0, l.gutter_w, body_h, theme::GUTTER_BG);
-    r.rect(l.gutter_w, 0.0, 1.0, body_h, theme::STATUS_BG);
+/// Everything the chrome needs that is not editor state.
+pub struct Chrome<'a> {
+    /// `Ludicrous: <file name>`, or just `Ludicrous` for an unnamed buffer.
+    pub title: &'a str,
+    pub modified: bool,
+    pub maximized: bool,
+    /// The item under the mouse, for hover feedback.
+    pub hover: Option<Hit>,
+}
+
+pub fn draw(r: &mut Renderer, ed: &Editor, l: &Layout, chrome: &Chrome) {
+    // The window itself: one rounded rectangle, with a 1 px border. The
+    // renderer's window mask clips everything to the same shape.
+    let radius = if chrome.maximized {
+        0.0
+    } else {
+        theme::WINDOW_RADIUS
+    };
+    r.set_window_shape(l.width, l.height, radius);
+    r.rounded_rect(0.0, 0.0, l.width, l.height, radius, theme::BG);
+
+    draw_title_bar(r, l, chrome);
+    if l.sidebar_w > 0.0 {
+        draw_sidebar(r, l);
+    }
+    draw_editor(r, ed, l);
+    draw_status_bar(r, ed, l);
+
+    // Border last, so it sits on top of the panels' edges.
+    if !chrome.maximized {
+        r.rounded_outline(0.0, 0.0, l.width, l.height, radius, 1.0, theme::BORDER);
+    }
+}
+
+fn draw_title_bar(r: &mut Renderer, l: &Layout, chrome: &Chrome) {
+    let h = l.title_h;
+    r.rect(0.0, 0.0, l.width, h, theme::SIDEBAR_BG);
+    r.rect(0.0, h - 1.0, l.width, 1.0, theme::BORDER);
+
+    // Sidebar toggle: three short lines, drawn as rects (no icon font yet).
+    let tx = 10.0;
+    let ty = (h - 12.0) * 0.5;
+    let toggle_hover = matches!(chrome.hover, Some(Hit::SidebarToggle));
+    if toggle_hover {
+        r.rounded_rect(4.0, 4.0, 22.0, h - 8.0, 4.0, theme::PILL_HOVER);
+    }
+    for i in 0..3 {
+        r.rect(tx, ty + i as f32 * 5.0, 12.0, 1.5, theme::MUTED);
+    }
+
+    // Title text, centred vertically in the bar.
+    let text_y = (h - l.cell_h) * 0.5 + 1.0;
+    let title_x = 30.0;
+    r.text_ui(title_x, text_y, chrome.title, theme::TITLE_TEXT);
+    if chrome.modified {
+        let dot_x = title_x + r.ui_text_width(chrome.title) + 6.0;
+        r.rounded_rect(dot_x, h * 0.5 - 3.0, 6.0, 6.0, 3.0, theme::ACCENT);
+    }
+
+    // Window buttons on the right: minimize, maximize, close.
+    let bw = crate::window::BUTTON_W;
+    let start = l.width - bw * 3.0;
+    for (i, button) in [
+        WindowButton::Minimize,
+        WindowButton::Maximize,
+        WindowButton::Close,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let x = start + i as f32 * bw;
+        let hovered = chrome.hover == Some(Hit::Button(button));
+        if hovered {
+            let color = if button == WindowButton::Close {
+                theme::CLOSE_HOVER
+            } else {
+                theme::PILL_HOVER
+            };
+            r.rect(x, 0.0, bw, h, color);
+        }
+        let cx = x + bw * 0.5;
+        let cy = h * 0.5;
+        let fg = if hovered && button == WindowButton::Close {
+            theme::TEXT
+        } else {
+            theme::MUTED
+        };
+        match button {
+            WindowButton::Minimize => r.rect(cx - 5.0, cy, 10.0, 1.5, fg),
+            WindowButton::Maximize => {
+                if chrome.maximized {
+                    // Restore: two overlapping squares.
+                    r.rounded_outline(cx - 5.0, cy - 4.0, 8.0, 8.0, 1.0, 1.0, fg);
+                    r.rounded_outline(cx - 2.0, cy - 6.0, 8.0, 8.0, 1.0, 1.0, fg);
+                } else {
+                    r.rounded_outline(cx - 5.0, cy - 5.0, 10.0, 10.0, 1.0, 1.0, fg);
+                }
+            }
+            WindowButton::Close => {
+                // Two diagonal strokes, approximated with thin rects.
+                for i in 0..10 {
+                    let t = i as f32;
+                    r.rect(cx - 5.0 + t, cy - 5.0 + t, 1.5, 1.5, fg);
+                    r.rect(cx + 4.0 - t, cy - 5.0 + t, 1.5, 1.5, fg);
+                }
+            }
+        }
+    }
+}
+
+fn draw_sidebar(r: &mut Renderer, l: &Layout) {
+    let top = l.title_h;
+    let h = l.height - top;
+    r.rect(0.0, top, l.sidebar_w, h, theme::SIDEBAR_BG);
+    r.rect(l.sidebar_w - 1.0, top, 1.0, h, theme::BORDER);
+
+    // Placeholder rows until Phase D builds the real tree. The rail mode only
+    // has room for the icon squares.
+    let rail = l.sidebar_w < theme::SIDEBAR_W;
+    let mut y = top + theme::PAD;
+    for i in 0..6 {
+        let row_h = theme::ROW_H;
+        if y + row_h > l.height - l.status_h {
+            break;
+        }
+        if i == 0 {
+            r.rounded_rect(
+                theme::PAD * 0.5,
+                y,
+                l.sidebar_w - theme::PAD,
+                row_h,
+                theme::PILL_RADIUS,
+                theme::PILL_ACTIVE,
+            );
+        }
+        let icon_x = if rail {
+            (l.sidebar_w - 14.0) * 0.5
+        } else {
+            12.0
+        };
+        r.icon(icon_x, y + 7.0, 14.0, theme::MUTED);
+        if !rail {
+            r.text_ui(34.0, y + 6.0, "src", theme::TEXT);
+        }
+        y += row_h;
+    }
+}
+
+fn draw_editor(r: &mut Renderer, ed: &Editor, l: &Layout) {
+    let body_top = l.title_h;
+    let body_h = l.height - l.status_h - body_top;
+
+    // Gutter band and its divider.
+    r.rect(l.sidebar_w, body_top, l.gutter_w, body_h, theme::GUTTER_BG);
+    r.rect(
+        l.sidebar_w + l.gutter_w,
+        body_top,
+        1.0,
+        body_h,
+        theme::BORDER,
+    );
 
     let first = ed.scroll;
     let last = (first + l.rows).min(ed.buffer.line_count());
     let mut digits_buf = [0u8; 20];
+
+    // Line numbers live in the gutter, outside the text-area clip, so they are
+    // drawn first.
+    for idx in first..last {
+        let y = l.text_y + (idx - first) as f32 * l.cell_h;
+        let num = format_usize(idx + 1, &mut digits_buf);
+        let nx = (l.sidebar_w + l.gutter_w - GUTTER_PAD - num.len() as f32 * l.cell_w).max(0.0);
+        r.text(nx, y, num, theme::GUTTER_TEXT);
+    }
 
     // Clip to the text area so a long line can never paint over the gutter or
     // the status bar. The clip is in points; the renderer scales it.
@@ -47,11 +197,6 @@ pub fn draw(r: &mut Renderer, ed: &Editor, l: &Layout) {
 
     for idx in first..last {
         let y = l.text_y + (idx - first) as f32 * l.cell_h;
-
-        // Right-align the line number inside the gutter.
-        let num = format_usize(idx + 1, &mut digits_buf);
-        let nx = (l.gutter_w - GUTTER_PAD - num.len() as f32 * l.cell_w).max(0.0);
-        r.text(nx, y, num, theme::GUTTER_TEXT);
 
         let line = ed.buffer.line(idx);
         // Selection highlight goes behind the text of this line.
@@ -88,10 +233,12 @@ pub fn draw(r: &mut Renderer, ed: &Editor, l: &Layout) {
     }
 
     r.pop_clip();
+}
 
-    // Status bar: filename on the left, position on the right.
+fn draw_status_bar(r: &mut Renderer, ed: &Editor, l: &Layout) {
     let sy = l.height - l.status_h;
     r.rect(0.0, sy, l.width, l.status_h, theme::STATUS_BG);
+    r.rect(0.0, sy, l.width, 1.0, theme::BORDER);
     let text_y = sy + ((l.status_h - l.cell_h) / 2.0).max(0.0) + 1.0;
 
     let name = match &ed.buffer.path {
@@ -101,20 +248,20 @@ pub fn draw(r: &mut Renderer, ed: &Editor, l: &Layout) {
             .unwrap_or("[No Name]"),
         None => "[No Name]",
     };
-    r.text(GUTTER_PAD, text_y, name, theme::STATUS_TEXT);
+    r.text_ui(GUTTER_PAD, text_y, name, theme::STATUS_TEXT);
     if let Some(msg) = &ed.status {
         // A failed save is more urgent than the modified marker, so it takes
         // that spot in the bar.
-        let mx = GUTTER_PAD + (name.chars().count() + 1) as f32 * l.cell_w;
-        r.text(mx, text_y, msg, theme::ERROR);
-    } else if ed.buffer.modified {
-        let mx = GUTTER_PAD + (name.chars().count() + 1) as f32 * l.cell_w;
-        r.text(mx, text_y, "[modified]", theme::MODIFIED);
+        let mx = GUTTER_PAD + r.ui_text_width(name) + 8.0;
+        r.text_ui(mx, text_y, msg, theme::ERROR);
+    } else if ed.is_dirty() {
+        let mx = GUTTER_PAD + r.ui_text_width(name) + 8.0;
+        r.text_ui(mx, text_y, "[modified]", theme::MODIFIED);
     }
 
     let pos = format!("Ln {}, Col {}", ed.cursor.line + 1, ed.cursor.col + 1);
-    let px = (l.width - GUTTER_PAD - pos.len() as f32 * l.cell_w).max(0.0);
-    r.text(px, text_y, &pos, theme::STATUS_TEXT);
+    let px = (l.width - GUTTER_PAD - r.ui_text_width(&pos)).max(0.0);
+    r.text_ui(px, text_y, &pos, theme::STATUS_TEXT);
 }
 
 /// The part of `line` that is visible when scrolled `scroll_x` columns right.

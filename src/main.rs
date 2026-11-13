@@ -8,6 +8,7 @@ mod editor;
 mod input;
 mod render;
 mod ui;
+mod window;
 
 use std::path::PathBuf;
 

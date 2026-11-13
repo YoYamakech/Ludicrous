@@ -1,13 +1,20 @@
 // layout.rs: where things go, in points. No drawing here.
-// The UI is deliberately simple: a left gutter, a text area, a status bar.
+//
+// The window is one rounded rectangle: a title bar across the top, an optional
+// sidebar on the left, then the editor (gutter + text area) and a status bar.
 
 use crate::render::Renderer;
+use crate::ui::theme;
 
 pub struct Layout {
     pub width: f32,
     pub height: f32,
     pub cell_w: f32,
     pub cell_h: f32,
+    /// Title bar height; the editor starts below it.
+    pub title_h: f32,
+    /// Sidebar width in points (0 when hidden).
+    pub sidebar_w: f32,
     pub gutter_w: f32,
     pub text_x: f32,
     pub text_y: f32,
@@ -26,15 +33,16 @@ const PAD_Y: f32 = 4.0; // padding above the first line
 const STATUS_LINES: f32 = 1.6; // status bar height in character rows
 
 impl Layout {
-    pub fn new(r: &Renderer, line_count: usize, width: f32, height: f32) -> Self {
+    pub fn new(r: &Renderer, line_count: usize, width: f32, height: f32, sidebar_w: f32) -> Self {
         let (cell_w, cell_h) = r.cell_size();
         let digits = line_count.max(1).to_string().len() as f32;
         let gutter_w = (digits * cell_w + PAD_X * 2.0).ceil();
         let status_h = (cell_h * STATUS_LINES).ceil();
-        let text_y = PAD_Y;
+        let title_h = theme::TITLE_H;
+        let text_y = title_h + PAD_Y;
         let usable = (height - status_h - text_y).max(cell_h);
         let rows = (usable / cell_h).floor().max(1.0) as usize;
-        let text_x = gutter_w + PAD_X;
+        let text_x = sidebar_w + gutter_w + PAD_X;
         let text_w = (width - text_x - PAD_X).max(cell_w);
         let cols = (text_w / cell_w).floor().max(1.0) as usize;
 
@@ -43,6 +51,8 @@ impl Layout {
             height,
             cell_w,
             cell_h,
+            title_h,
+            sidebar_w,
             gutter_w,
             text_x,
             text_y,
@@ -54,7 +64,7 @@ impl Layout {
     }
 
     /// Map a point in the window to a buffer position, or `None` when the
-    /// point is outside the text area (gutter, status bar, padding).
+    /// point is outside the text area (gutter, sidebar, title or status bar).
     ///
     /// `scroll`/`scroll_x` are the editor's current scroll offsets, so the
     /// result is in buffer coordinates, not screen ones.
