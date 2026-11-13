@@ -7,6 +7,7 @@
 pub mod cursor;
 pub mod focus;
 pub mod hitmap;
+pub mod icons_map;
 pub mod layout;
 pub mod overlay;
 pub mod settings;

@@ -39,6 +39,8 @@ use crate::workspace::{self, Workspace};
 // font on a fresh machine.
 const FONT: &[u8] = include_bytes!("../assets/font.ttf");
 const ICONS: &[u8] = include_bytes!("../assets/icons.ttf");
+// Nerd Font Symbols, subset to the file-type glyphs in `ui/icons_map.rs`.
+const SYMBOLS: &[u8] = include_bytes!("../assets/symbols.ttf");
 
 struct GlState {
     surface: Surface<WindowSurface>,
@@ -414,7 +416,7 @@ impl App {
             })
         };
 
-        let mut renderer = Renderer::new(gl, FONT, ICONS, self.config.font_size as f32);
+        let mut renderer = Renderer::new(gl, FONT, ICONS, SYMBOLS, self.config.font_size as f32);
         renderer.set_tab_width(self.config.tab_width);
         renderer.set_scale(window.scale_factor() as f32);
 

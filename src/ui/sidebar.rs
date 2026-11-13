@@ -221,12 +221,18 @@ pub fn draw(
         } else if state.hover_open == Some(i) {
             pill(r, inner_x, y, inner_w, p.pill_hover);
         }
-        r.icon(
+        // The open-files row knows the buffer's path, so it gets the same icon
+        // as the tree entry for the same file.
+        let icon = match ws.buffers.get(i).and_then(|b| b.path()) {
+            Some(path) => crate::ui::icons_map::icon_for(path, false, false),
+            None => crate::ui::icons_map::icon_for(std::path::Path::new(""), false, false),
+        };
+        r.file_icon(
             pad + 2.0,
             y + (theme::ROW_H - 14.0) * 0.5,
-            Icon::File,
+            icon.glyph,
             14.0,
-            p.muted,
+            icon.accent,
         );
         let color = if i == ws.active { p.text } else { p.muted };
         let label = truncate(r, label, w - pad - 44.0);
@@ -281,13 +287,11 @@ pub fn draw(
             };
             r.icon(indent, y + 7.0, chevron, 12.0, p.muted);
         }
-        let icon = match (row.is_dir, row.expanded) {
-            (true, true) => Icon::FolderOpen,
-            (true, false) => Icon::Folder,
-            (false, _) => Icon::File,
-        };
+        // File-type icon and accent from one table (`ui/icons_map.rs`). The
+        // name keeps the normal text colour; only the icon is tinted.
+        let icon = crate::ui::icons_map::icon_for(&row.path, row.is_dir, row.expanded);
         let icon_x = indent + 14.0;
-        r.icon(icon_x, y + 7.0, icon, 14.0, p.muted);
+        r.file_icon(icon_x, y + 7.0, icon.glyph, 14.0, icon.accent);
         let tx = icon_x + 20.0;
         let color = if row.is_dir { p.text } else { p.status_text };
         let name = truncate(r, &row.name, w - tx - pad);

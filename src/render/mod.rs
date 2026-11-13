@@ -79,6 +79,9 @@ pub struct Renderer {
     // Kept so the atlases can be re-rasterized when the scale factor changes.
     font_bytes: Vec<u8>,
     icon_bytes: Vec<u8>,
+    /// Nerd Font Symbols subset, for file-type icons. Rasterized into the icon
+    /// atlas, so file icons and chrome icons are both `Renderer::icon` quads.
+    symbols_bytes: Vec<u8>,
     font_px: f32,
     ui_px: f32,
     /// Columns per tab stop (the `tab_width` setting).
@@ -105,7 +108,13 @@ pub struct Renderer {
 impl Renderer {
     /// `font_px` is the editor font size in points; the atlas is rasterized at
     /// `font_px * scale` so text stays sharp on HiDPI screens.
-    pub fn new(gl: glow::Context, font_bytes: &[u8], icon_bytes: &[u8], font_px: f32) -> Self {
+    pub fn new(
+        gl: glow::Context,
+        font_bytes: &[u8],
+        icon_bytes: &[u8],
+        symbols_bytes: &[u8],
+        font_px: f32,
+    ) -> Self {
         let caps = GlCaps::detect(&gl);
         let (gl_version, gl_renderer) = unsafe {
             (
@@ -129,7 +138,7 @@ impl Renderer {
         let ui_px = 13.0;
         let atlas = font::build(&gl, font_bytes, font_px * scale);
         let ui_atlas = font::build(&gl, font_bytes, ui_px * scale);
-        let icon_atlas = icons::build(&gl, icon_bytes, icons::ICON_PX * scale);
+        let icon_atlas = icons::build(&gl, icon_bytes, symbols_bytes, icons::ICON_PX * scale);
 
         unsafe {
             gl.enable(glow::BLEND);
@@ -164,6 +173,7 @@ impl Renderer {
             scale,
             font_bytes: font_bytes.to_vec(),
             icon_bytes: icon_bytes.to_vec(),
+            symbols_bytes: symbols_bytes.to_vec(),
             font_px,
             ui_px,
             tab_columns: TAB_COLUMNS,
@@ -254,7 +264,12 @@ impl Renderer {
         }
         self.atlas = font::build(&self.gl, &self.font_bytes, self.font_px * scale);
         self.ui_atlas = font::build(&self.gl, &self.font_bytes, self.ui_px * scale);
-        self.icon_atlas = icons::build(&self.gl, &self.icon_bytes, icons::ICON_PX * scale);
+        self.icon_atlas = icons::build(
+            &self.gl,
+            &self.icon_bytes,
+            &self.symbols_bytes,
+            icons::ICON_PX * scale,
+        );
     }
 
     /// Start a frame: set the viewport, clear, and reset the batches.
@@ -390,7 +405,19 @@ impl Renderer {
     /// Icons are tinted by `color`, so one atlas serves every state.
     #[allow(dead_code)] // shell chrome (Phase D)
     pub fn icon(&mut self, x: f32, y: f32, icon: Icon, size: f32, color: Color) {
-        let Some(g) = self.icon_atlas.get(icon).copied() else {
+        self.icon_char(x, y, icon.ch(), size, color);
+    }
+
+    /// A file-type symbol from the Nerd Font subset, drawn exactly like a chrome
+    /// icon because both live in the icon atlas.
+    pub fn file_icon(&mut self, x: f32, y: f32, glyph: char, size: f32, color: Color) {
+        self.icon_char(x, y, glyph, size, color);
+    }
+
+    fn icon_char(&mut self, x: f32, y: f32, glyph: char, size: f32, color: Color) {
+        let Some(g) = self.icon_atlas.get_char(glyph).copied() else {
+            // A missing glyph draws nothing rather than a wrong box: a file icon
+            // is decoration, not content (v1.2 section 4).
             return;
         };
         // A shape queued after text must paint over it; same rule as shape().

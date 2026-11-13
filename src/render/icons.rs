@@ -87,25 +87,43 @@ pub struct IconAtlas {
 }
 
 impl IconAtlas {
-    pub fn get(&self, icon: Icon) -> Option<&IconGlyph> {
-        let ch = icon.ch();
+    /// A glyph by codepoint. The file-type symbols live in a different font
+    /// (Nerd Font Symbols) but in this same atlas: the renderer only ever sees
+    /// quads on one texture, so mixing the two costs nothing.
+    pub fn get_char(&self, ch: char) -> Option<&IconGlyph> {
         self.glyphs.iter().find(|(c, _)| *c == ch).map(|(_, g)| g)
     }
 }
 
 /// Rasterize the icon subset into one small texture. `px` is the em size in
 /// physical pixels (ICON_PX * scale).
-pub fn build(gl: &glow::Context, font_bytes: &[u8], px: f32) -> IconAtlas {
+///
+/// `symbols_bytes` is the Nerd Font subset used for file-type icons. It is
+/// rasterized into the *same* texture, so a file icon is the same kind of quad
+/// as a chrome icon and the renderer needs no second batch.
+pub fn build(gl: &glow::Context, font_bytes: &[u8], symbols_bytes: &[u8], px: f32) -> IconAtlas {
     let font =
         Font::from_bytes(font_bytes, FontSettings::default()).expect("failed to parse icons");
+    let symbols = Font::from_bytes(symbols_bytes, FontSettings::default())
+        .expect("failed to parse the Nerd Font symbols subset");
 
     const ATLAS: u32 = 128;
     let mut pixels = vec![0u8; (ATLAS * ATLAS) as usize];
     let mut glyphs = Vec::with_capacity(Icon::ALL.len());
     let (mut x, mut y, mut row_h) = (1u32, 1u32, 0u32);
 
-    for icon in Icon::ALL {
-        let (metrics, bitmap) = font.rasterize(icon.ch(), px);
+    // Chrome icons from the Lucide subset, then the file symbols. Both land in
+    // the same shelf-packed atlas.
+    let sources = Icon::ALL.iter().map(|icon| (&font, icon.ch())).chain(
+        crate::ui::icons_map::ALL_GLYPHS
+            .iter()
+            .map(|&ch| (&symbols, ch)),
+    );
+    for (source, ch) in sources {
+        if glyphs.iter().any(|(c, _)| *c == ch) {
+            continue; // the two subsets must not overlap, but never duplicate
+        }
+        let (metrics, bitmap) = source.rasterize(ch, px);
         let (w, h) = (metrics.width as u32, metrics.height as u32);
         if w == 0 || h == 0 {
             continue;
@@ -121,7 +139,7 @@ pub fn build(gl: &glow::Context, font_bytes: &[u8], px: f32) -> IconAtlas {
             pixels[dst..dst + w as usize].copy_from_slice(&bitmap[src..src + w as usize]);
         }
         glyphs.push((
-            icon.ch(),
+            ch,
             IconGlyph {
                 w: w as f32,
                 h: h as f32,
