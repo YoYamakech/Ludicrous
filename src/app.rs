@@ -352,6 +352,20 @@ impl App {
         self.state.save();
     }
 
+    /// F11 / the titlebar button: enter borderless fullscreen, or leave it.
+    /// One place, so the button and the key cannot disagree (issue #6.8).
+    fn toggle_fullscreen(&mut self) {
+        if let Some(w) = self.window.as_ref() {
+            let next = if w.fullscreen().is_some() {
+                None
+            } else {
+                Some(Fullscreen::Borderless(None))
+            };
+            w.set_fullscreen(next);
+            w.request_redraw();
+        }
+    }
+
     fn toggle_settings(&mut self) {
         self.settings_open = !self.settings_open;
         self.focus = if self.settings_open {
@@ -1657,6 +1671,24 @@ impl ApplicationHandler<UserEvent> for App {
                 if event.state != ElementState::Pressed {
                     return;
                 }
+                // Global window shortcuts come first, before any focus-specific
+                // dispatch. They belong to the window, not to the editor, the
+                // tree or the settings page, so they work from all of them
+                // (issue #6.5, #6.6). The settings page must not swallow them.
+                match event.logical_key {
+                    winit::keyboard::Key::Named(winit::keyboard::NamedKey::F3) => {
+                        self.debug = !self.debug;
+                        if let Some(w) = self.window.as_ref() {
+                            w.request_redraw();
+                        }
+                        return;
+                    }
+                    winit::keyboard::Key::Named(winit::keyboard::NamedKey::F11) => {
+                        self.toggle_fullscreen();
+                        return;
+                    }
+                    _ => {}
+                }
                 // Ctrl+, opens or closes the settings page.
                 if self.mods.control_key()
                     && matches!(&event.logical_key,
@@ -1708,32 +1740,6 @@ impl ApplicationHandler<UserEvent> for App {
                     if !self.mods.control_key() {
                         return;
                     }
-                }
-                // Shell shortcuts that are not editor commands.
-                if matches!(
-                    event.logical_key,
-                    winit::keyboard::Key::Named(winit::keyboard::NamedKey::F3)
-                ) {
-                    self.debug = !self.debug;
-                    if let Some(w) = self.window.as_ref() {
-                        w.request_redraw();
-                    }
-                    return;
-                }
-                if matches!(
-                    event.logical_key,
-                    winit::keyboard::Key::Named(winit::keyboard::NamedKey::F11)
-                ) {
-                    if let Some(w) = self.window.as_ref() {
-                        let next = if w.fullscreen().is_some() {
-                            None
-                        } else {
-                            Some(Fullscreen::Borderless(None))
-                        };
-                        w.set_fullscreen(next);
-                        w.request_redraw();
-                    }
-                    return;
                 }
                 if self.mods.control_key()
                     && matches!(&event.logical_key,
