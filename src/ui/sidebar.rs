@@ -204,6 +204,12 @@ pub fn draw(
     p: &Palette,
 ) {
     let w = l.sidebar_w;
+    // A hidden sidebar submits nothing at all: no quads, no text, no work
+    // (issue #5.2). Fragment clipping would hide it, but it would still cost
+    // the layout and the instances.
+    if w <= 0.0 {
+        return;
+    }
     r.rect(0.0, geo.top, w, geo.height, p.sidebar_bg);
     r.rect(w - 1.0, geo.top, 1.0, geo.height, p.border);
 
