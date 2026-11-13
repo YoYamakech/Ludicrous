@@ -16,6 +16,10 @@ pub struct Workspace {
     pub buffers: Vec<Editor>,
     pub active: usize,
     pub tree: FileTree,
+    /// One flag per buffer: the user has already said "discard" for it. Kept
+    /// parallel to `buffers` so quitting with several dirty files asks about
+    /// each one in turn instead of losing them silently.
+    quit_ok: Vec<bool>,
 }
 
 /// What happened when a file was opened. The app uses this to decide whether
@@ -36,6 +40,7 @@ impl Workspace {
             buffers: vec![Editor::new(Buffer::empty())],
             active: 0,
             tree: FileTree::new(),
+            quit_ok: vec![false],
         }
     }
 
@@ -94,10 +99,12 @@ impl Workspace {
             && self.buffers[0].path().is_none()
         {
             self.buffers[0] = Editor::new(buffer);
+            self.quit_ok[0] = false;
             self.active = 0;
             return Ok(OpenResult::Opened(0));
         }
         self.buffers.push(Editor::new(buffer));
+        self.quit_ok.push(false);
         self.active = self.buffers.len() - 1;
         Ok(OpenResult::Opened(self.active))
     }
@@ -139,9 +146,13 @@ impl Workspace {
             return Control::Continue;
         }
         self.buffers.remove(self.active);
+        if self.active < self.quit_ok.len() {
+            self.quit_ok.remove(self.active);
+        }
         if self.buffers.is_empty() {
             // Never leave the window without an editor: keep one empty buffer.
             self.buffers.push(Editor::new(Buffer::empty()));
+            self.quit_ok.push(false);
             self.active = 0;
         } else if self.active >= self.buffers.len() {
             self.active = self.buffers.len() - 1;
@@ -151,14 +162,58 @@ impl Workspace {
 
     /// Quit guard for the whole workspace: every dirty buffer must be
     /// acknowledged. Returns Quit only when nothing is left to save.
+    ///
+    /// With several dirty buffers the guard walks them one at a time: the
+    /// window switches to the next unacknowledged one and warns, so pressing
+    /// Ctrl+Q from a *clean* buffer can never silently drop another buffer's
+    /// changes.
     pub fn request_quit(&mut self) -> Control {
         // Ask the emptiest question first: if nothing is dirty, go.
         if !self.any_dirty() {
             return Control::Quit;
         }
-        // Warn on the active buffer; the status bar shows its message.
-        let ed = &mut self.buffers[self.active];
-        ed.request_quit()
+        if self.quit_ok.len() != self.buffers.len() {
+            self.quit_ok.resize(self.buffers.len(), false);
+        }
+
+        // Everything dirty has been acknowledged: really quit.
+        let pending: Vec<usize> = (0..self.buffers.len())
+            .filter(|&i| self.buffers[i].is_dirty() && !self.quit_ok[i])
+            .collect();
+        if pending.is_empty() {
+            return Control::Quit;
+        }
+
+        // Switch to a pending buffer so its warning is the one on screen.
+        let next = if pending.contains(&self.active) {
+            self.active
+        } else {
+            pending[0]
+        };
+        self.active = next;
+
+        // The first request only warns; a second one within the window is the
+        // "discard" acknowledgement for this buffer.
+        let ed = &mut self.buffers[next];
+        if ed.request_quit() == Control::Quit {
+            self.quit_ok[next] = true;
+            // Ask about the rest in the same gesture.
+            return self.request_quit();
+        }
+        let remaining = pending.len();
+        ed.status = Some(if remaining > 1 {
+            format!(
+                "{} has unsaved changes ({} files left): press Ctrl+Q again to discard",
+                buffer_name(ed),
+                remaining
+            )
+        } else {
+            format!(
+                "{} has unsaved changes: press Ctrl+Q again to discard",
+                buffer_name(ed)
+            )
+        });
+        Control::Continue
     }
 }
 
@@ -285,6 +340,58 @@ mod tests {
             .apply(crate::editor::Command::Insert('x'));
         assert_eq!(ws.request_quit(), Control::Continue);
         assert_eq!(ws.request_quit(), Control::Quit);
+    }
+
+    #[test]
+    fn quitting_from_a_clean_buffer_still_asks_about_a_dirty_one() {
+        let a = tmp("guard-a", "a");
+        let b = tmp("guard-b", "b");
+        let mut ws = Workspace::new();
+        ws.open_file(&a).unwrap();
+        ws.open_file(&b).unwrap();
+        // Dirty buffer 0 while buffer 1 (active) is clean.
+        ws.buffers[0].apply(crate::editor::Command::Insert('z'));
+        assert_eq!(ws.active, 1);
+        assert_eq!(ws.request_quit(), Control::Continue, "must warn, not quit");
+        assert_eq!(ws.active, 0, "the guard switches to the dirty buffer");
+        assert!(ws.buffers[0]
+            .status
+            .as_deref()
+            .unwrap_or_default()
+            .contains("press Ctrl+Q again"));
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn the_quit_guard_walks_every_dirty_buffer() {
+        let a = tmp("walk-a", "a");
+        let b = tmp("walk-b", "b");
+        let mut ws = Workspace::new();
+        ws.open_file(&a).unwrap();
+        ws.open_file(&b).unwrap();
+        ws.buffers[0].apply(crate::editor::Command::Insert('x'));
+        ws.buffers[1].apply(crate::editor::Command::Insert('y'));
+        // Each buffer needs two requests: warn, then discard.
+        assert_eq!(ws.request_quit(), Control::Continue);
+        assert_eq!(ws.request_quit(), Control::Continue, "next dirty buffer");
+        assert_eq!(ws.request_quit(), Control::Quit);
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    #[test]
+    fn closing_never_desyncs_the_quit_flags() {
+        let a = tmp("sync-a", "a");
+        let b = tmp("sync-b", "b");
+        let mut ws = Workspace::new();
+        ws.open_file(&a).unwrap();
+        ws.open_file(&b).unwrap();
+        ws.close_active();
+        assert_eq!(ws.buffers.len(), 1);
+        assert_eq!(ws.quit_ok.len(), 1);
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
     }
 
     #[test]

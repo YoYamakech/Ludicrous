@@ -748,6 +748,20 @@ impl ApplicationHandler for App {
                 let Some(cmd) = input::key(&event, self.mods) else {
                     return;
                 };
+                // Quit is a workspace question, not an editor one: the guard
+                // has to walk every dirty buffer.
+                if cmd == Command::Quit {
+                    let quit = match self.workspace.as_mut() {
+                        Some(ws) => ws.request_quit() == Control::Quit,
+                        None => true,
+                    };
+                    if quit {
+                        event_loop.exit();
+                    } else if let Some(w) = self.window.as_ref() {
+                        w.request_redraw();
+                    }
+                    return;
+                }
                 // Copy/Cut read the selection before the editor changes it.
                 if matches!(cmd, Command::Copy | Command::Cut) {
                     self.copy_selection();
