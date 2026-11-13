@@ -50,6 +50,9 @@ impl App {
     }
 }
 
+/// Half a blink cycle: on for this long, then off for this long.
+const BLINK_PERIOD: std::time::Duration = std::time::Duration::from_millis(530);
+
 // The font is compiled into the binary: no file lookup at startup, no missing
 // font on a fresh machine.
 const FONT: &[u8] = include_bytes!("../assets/font.ttf");
@@ -150,6 +153,9 @@ pub struct App {
     settings_hover_seg: Option<usize>,
     /// Window geometry to restore at startup and write back on exit.
     state: WindowState,
+    /// Whether the window has keyboard focus. A caret does not blink in an
+    /// unfocused window, so the blink timer must stop too (issue #5).
+    window_focused: bool,
     /// Cursor blink phase (only used when `config.cursor_blink` is on).
     blink_on: bool,
     /// When the blink phase flips next.
@@ -225,6 +231,7 @@ impl App {
             settings_hover: None,
             settings_hover_seg: None,
             state: WindowState::default(),
+            window_focused: true,
             blink_on: true,
             blink_at: std::time::Instant::now(),
             debug: false,
@@ -354,6 +361,18 @@ impl App {
             }
         };
         self.state.save();
+    }
+
+    /// Is there a blinking caret that the user could actually see right now?
+    ///
+    /// Only in the editor, only with the window focused, only with the settings
+    /// page closed and only when blinking is switched on. Everything else must
+    /// leave the loop in `Wait` (issue #5).
+    fn caret_visible_now(&self) -> bool {
+        self.config.cursor_blink
+            && self.window_focused
+            && !self.settings_open
+            && self.focus == Focus::Editor
     }
 
     /// F11 / the titlebar button: enter borderless fullscreen, or leave it.
@@ -1451,7 +1470,13 @@ impl App {
             maximized: window.is_maximized() || window.fullscreen().is_some(),
             hover,
             focus: self.focus,
-            caret: self.blink_on || !self.config.cursor_blink,
+            // A caret is drawn only where one can be used: the editor, with
+            // the window focused. It is solid when blinking is off, and solid
+            // again the instant focus returns (issue #5).
+            caret: self.focus == Focus::Editor
+                && !self.settings_open
+                && self.window_focused
+                && (self.blink_on || !self.config.cursor_blink),
             drop_hover: self.drop_hover,
             update_note: update_note.as_deref(),
             update_badge,
@@ -1645,7 +1670,10 @@ impl ApplicationHandler<UserEvent> for App {
         let wake_at = self.maybe_check_updates();
         #[cfg(not(feature = "updater"))]
         let wake_at: Option<std::time::Instant> = None;
-        if !self.config.cursor_blink {
+        if !self.caret_visible_now() {
+            // No caret on screen: no blink timer at all. This is what keeps the
+            // loop at `Wait` (0.0% CPU) on the settings page, with the tree
+            // focused, and while the window is unfocused (issue #5).
             self.blink_on = true;
             match wake_at {
                 Some(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
@@ -1656,7 +1684,7 @@ impl ApplicationHandler<UserEvent> for App {
         let now = std::time::Instant::now();
         if now >= self.blink_at {
             self.blink_on = !self.blink_on;
-            self.blink_at = now + std::time::Duration::from_millis(530);
+            self.blink_at = now + BLINK_PERIOD;
             if let Some(w) = self.window.as_ref() {
                 w.request_redraw();
             }
@@ -1704,6 +1732,20 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::RedrawRequested => self.redraw(event_loop),
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
+            WindowEvent::Focused(on) => {
+                self.window_focused = on;
+                if on {
+                    // Come back with a visible caret, not mid-blink.
+                    self.blink_on = true;
+                    self.blink_at = std::time::Instant::now() + BLINK_PERIOD;
+                }
+                // Focus changes the caret's visibility, so the frame must be
+                // redrawn (and the blink timer rescheduled) either way.
+                if let Some(w) = self.window.as_ref() {
+                    w.request_redraw();
+                }
+                self.refresh_cursor();
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state != ElementState::Pressed {
                     return;
