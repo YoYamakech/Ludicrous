@@ -35,6 +35,21 @@ use crate::ui::view;
 use crate::window::{self, HitState, ResizeDirection, WindowButton};
 use crate::workspace::{self, Workspace};
 
+// The updater's app-side glue lives in its own file: it is all about timing and
+// threads, which would clutter the event loop code here.
+#[cfg(feature = "updater")]
+mod update;
+
+// The settings page always has an `UpdateInfo`; without the feature it is the
+// fixed default `Check now` row, which the page never renders anyway because
+// those rows are `#[cfg]`ed out of `Row::ALL`.
+impl App {
+    #[cfg(not(feature = "updater"))]
+    fn update_info(&self) -> settings::UpdateInfo {
+        settings::UpdateInfo::default()
+    }
+}
+
 // The font is compiled into the binary: no file lookup at startup, no missing
 // font on a fresh machine.
 const FONT: &[u8] = include_bytes!("../assets/font.ttf");
@@ -59,6 +74,9 @@ pub enum UserEvent {
     ///
     /// The tree is boxed because it is large and this enum is moved around;
     /// `Tree` is `Send` (checked), which is what makes the thread possible.
+    /// The updater has news: a new release, progress, or a result.
+    #[cfg(feature = "updater")]
+    Update(crate::updater::UpdateEvent),
     #[cfg(feature = "syntax")]
     ParseDone {
         buffer: usize,
@@ -154,6 +172,23 @@ pub struct App {
     last_frame: std::time::Instant,
     /// `LUDICROUS_DEBUG_ANIM=1`: log the animated values once per frame.
     anim_debug: bool,
+    /// Where the update flow is right now (v1.2 section 9). Only the badge and
+    /// the Settings rows read it.
+    #[cfg(feature = "updater")]
+    update: crate::updater::UpdateState,
+    /// True once an automatic check has been started this session, so
+    /// `about_to_wait` cannot start a second one.
+    #[cfg(feature = "updater")]
+    update_check_started: bool,
+    /// When the first frame was swapped. The automatic update check waits ten
+    /// seconds after this, so cold start is never competing with a network
+    /// thread.
+    #[cfg(feature = "updater")]
+    first_frame_at: Option<std::time::Instant>,
+    /// Last progress event forwarded to the UI, so a fast download cannot force
+    /// a redraw per 64 KB chunk.
+    #[cfg(feature = "updater")]
+    last_progress_at: std::time::Instant,
 }
 
 impl App {
@@ -198,6 +233,14 @@ impl App {
             anims: crate::ui::anim::UiAnims::default(),
             last_frame: std::time::Instant::now(),
             anim_debug: std::env::var_os("LUDICROUS_DEBUG_ANIM").is_some(),
+            #[cfg(feature = "updater")]
+            update: crate::updater::UpdateState::default(),
+            #[cfg(feature = "updater")]
+            update_check_started: false,
+            #[cfg(feature = "updater")]
+            first_frame_at: None,
+            #[cfg(feature = "updater")]
+            last_progress_at: std::time::Instant::now(),
         }
     }
 
@@ -211,6 +254,12 @@ impl App {
         } else if self.time_to_first_frame_ms.is_none() && first_frame {
             self.time_to_first_frame_ms = Some(ms);
             eprintln!("ludicrous: time to first frame {ms:.0} ms");
+            // The update check is scheduled from here: ten seconds after the
+            // frame the user actually sees.
+            #[cfg(feature = "updater")]
+            {
+                self.first_frame_at = Some(std::time::Instant::now());
+            }
         }
     }
 
@@ -219,6 +268,8 @@ impl App {
     pub fn load_settings(&mut self) {
         self.config = Config::load();
         self.state = WindowState::load();
+        #[cfg(feature = "updater")]
+        self.fake_update_from_env();
         // A sidebar mode chosen with Ctrl+B (or a resize) last time wins over
         // `auto`, matching the spec's "last sidebar mode" in the state file.
         if self.config.sidebar == SidebarMode::Auto {
@@ -644,7 +695,7 @@ impl App {
 
         // Settings page, over the text area.
         if self.settings_open {
-            settings::register(&mut map, &layout, &self.config);
+            settings::register(&mut map, &layout, &self.config, &self.update_info());
         }
 
         // Title bar and resize edges, last: the front-most pixels.
@@ -704,8 +755,16 @@ impl App {
 
     /// Keyboard handling for the settings page. Returns true when the key was
     /// consumed.
-    fn settings_key(&mut self, event: &winit::event::KeyEvent) -> bool {
+    fn settings_key(
+        &mut self,
+        event: &winit::event::KeyEvent,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+    ) -> bool {
         use winit::keyboard::{Key, NamedKey};
+        // Only the updater's action row needs the loop; the parameter is
+        // uniform so a feature-off build has one code path.
+        #[cfg(not(feature = "updater"))]
+        let _ = event_loop;
         match event.logical_key {
             Key::Named(NamedKey::Escape) => {
                 self.settings_open = false;
@@ -720,6 +779,17 @@ impl App {
             }
             Key::Named(NamedKey::ArrowRight) | Key::Named(NamedKey::Enter) => {
                 let row = settings::Row::from_index(self.settings_row);
+                // Enter and Right on the action row press the button; on every
+                // other row they step the value.
+                #[cfg(feature = "updater")]
+                if row == settings::Row::UpdateAction
+                    && matches!(event.logical_key, Key::Named(NamedKey::Enter))
+                {
+                    if self.update_info().enabled {
+                        self.run_update_action(event_loop);
+                    }
+                    return true;
+                }
                 self.change_config(|c| settings::step(c, row, 1));
             }
             Key::Named(NamedKey::ArrowLeft) => {
@@ -751,8 +821,23 @@ impl App {
 
     /// Apply one click on a settings control piece. Returns true when the row
     /// under the pointer changed (so the hover wash can follow).
-    fn settings_click_part(&mut self, row: usize, part: Option<usize>) -> bool {
+    fn settings_click_part(
+        &mut self,
+        row: usize,
+        part: Option<usize>,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+    ) -> bool {
         let setting = settings::Row::from_index(row);
+        #[cfg(not(feature = "updater"))]
+        let _ = event_loop;
+        #[cfg(feature = "updater")]
+        if setting == settings::Row::UpdateAction {
+            // The action row is a button: only an enabled one reacts.
+            if part.is_some() && self.update_info().enabled {
+                self.run_update_action(event_loop);
+            }
+            return true;
+        }
         let before = self.config.clone();
         let changed = settings::apply_part(&mut self.config, setting, part);
         if changed {
@@ -1251,6 +1336,9 @@ impl App {
         // This runs before the GL borrows below, because it takes `self`.
         #[cfg(feature = "syntax")]
         self.start_async_parse_if_needed();
+        // Both read `self`, so they must be built before the GL borrows below.
+        #[cfg(feature = "updater")]
+        let settings_update_info = self.update_info();
         let (Some(window), Some(gl), Some(ws)) = (
             self.window.as_ref(),
             self.gl.as_mut(),
@@ -1313,6 +1401,15 @@ impl App {
         // whole pixels, so text stays crisp mid-move.
         let scroll_lines = scroll_pos;
         let modified = ws.active_editor().map(|e| e.is_dirty()).unwrap_or(false);
+        // Owned, so the borrow of `self.update` ends before the GL borrow.
+        #[cfg(feature = "updater")]
+        let update_note = self.update.status_line();
+        #[cfg(feature = "updater")]
+        let update_badge = self.update.badge();
+        #[cfg(not(feature = "updater"))]
+        let update_note: Option<String> = None;
+        #[cfg(not(feature = "updater"))]
+        let update_badge = false;
         let palette = Palette::of(self.config.theme);
         let chrome = view::Chrome {
             title: &title,
@@ -1322,6 +1419,8 @@ impl App {
             focus: self.focus,
             caret: self.blink_on || !self.config.cursor_blink,
             drop_hover: self.drop_hover,
+            update_note: update_note.as_deref(),
+            update_badge,
             scroll_lines,
             spans: &spans,
             span_first,
@@ -1336,11 +1435,16 @@ impl App {
         if self.settings_open {
             r.layer(crate::render::Layer::Overlay);
             r.rect(layout.sidebar_w, 0.0, w - layout.sidebar_w, h, palette.bg);
+            #[cfg(feature = "updater")]
+            let update_info = &settings_update_info;
+            #[cfg(not(feature = "updater"))]
+            let update_info = &settings::UpdateInfo::default();
             settings::draw(
                 r,
                 &layout,
                 &palette,
                 &self.config,
+                update_info,
                 self.settings_row,
                 self.settings_hover,
             );
@@ -1483,9 +1587,19 @@ impl ApplicationHandler<UserEvent> for App {
             let paths = std::mem::take(&mut self.pending_drops);
             self.open_paths(&paths);
         }
+        // The update check may want a future wake-up (ten seconds after the
+        // first frame). It never polls: it either does nothing or names the one
+        // instant to wake at.
+        #[cfg(feature = "updater")]
+        let wake_at = self.maybe_check_updates();
+        #[cfg(not(feature = "updater"))]
+        let wake_at: Option<std::time::Instant> = None;
         if !self.config.cursor_blink {
             self.blink_on = true;
-            event_loop.set_control_flow(ControlFlow::Wait);
+            match wake_at {
+                Some(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
+                None => event_loop.set_control_flow(ControlFlow::Wait),
+            }
             return;
         }
         let now = std::time::Instant::now();
@@ -1496,7 +1610,13 @@ impl ApplicationHandler<UserEvent> for App {
                 w.request_redraw();
             }
         }
-        event_loop.set_control_flow(ControlFlow::WaitUntil(self.blink_at));
+        // The earlier of the blink flip and the update check: one wake-up, not
+        // two, and still `WaitUntil` rather than a poll.
+        let at = match wake_at {
+            Some(at) => at.min(self.blink_at),
+            None => self.blink_at,
+        };
+        event_loop.set_control_flow(ControlFlow::WaitUntil(at));
     }
 
     /// Background threads deliver here, on the UI thread. Keep this small: a
@@ -1504,6 +1624,8 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::DialogResult(kind, paths) => self.dialog_result(kind, paths),
+            #[cfg(feature = "updater")]
+            UserEvent::Update(ev) => self.update_event(ev),
             #[cfg(feature = "syntax")]
             UserEvent::ParseDone {
                 buffer,
@@ -1546,7 +1668,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // While the settings page is open it owns the keyboard: it
                 // replaces the text area, so the editor must not see these.
                 if self.settings_open {
-                    if self.settings_key(&event) {
+                    if self.settings_key(&event, event_loop) {
                         if let Some(w) = self.window.as_ref() {
                             w.request_redraw();
                         }
@@ -1797,7 +1919,7 @@ impl ApplicationHandler<UserEvent> for App {
                     Some(Target::SettingsRow { row, part }) => {
                         self.settings_row = row;
                         self.focus = Focus::Settings;
-                        if self.settings_click_part(row, part) {
+                        if self.settings_click_part(row, part, event_loop) {
                             self.settings_hover = Some(row);
                         }
                         if let Some(w) = self.window.as_ref() {

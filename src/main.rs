@@ -13,6 +13,7 @@ mod editor;
 mod input;
 mod render;
 mod ui;
+mod updater;
 mod window;
 mod workspace;
 

@@ -50,6 +50,12 @@ pub struct Chrome<'a> {
     /// True while files are being dragged over the window: draw the drop
     /// highlight (v1.2 section 5.2).
     pub drop_hover: bool,
+    /// The updater's one-line message, or `None`. Shown at the right of the
+    /// status bar with a small download badge (v1.2 section 9.2).
+    pub update_note: Option<&'a str>,
+    /// Whether to draw the badge next to the note. False for a progress or a
+    /// failure message, true for "available" and "ready".
+    pub update_badge: bool,
 }
 
 pub fn draw(r: &mut Renderer, ws: &Workspace, l: &Layout, chrome: &Chrome) {
@@ -73,7 +79,7 @@ pub fn draw(r: &mut Renderer, ws: &Workspace, l: &Layout, chrome: &Chrome) {
     if !chrome.settings {
         draw_editor(r, ed, l, p, chrome);
     }
-    draw_status_bar(r, ed, l, p);
+    draw_status_bar(r, ed, l, p, chrome);
 
     // Drop highlight: a 2 px accent ring around the whole window, on top of
     // everything, plus one short line of text. Both disappear with the drop.
@@ -275,7 +281,7 @@ fn draw_editor(r: &mut Renderer, ed: &Editor, l: &Layout, p: &Palette, chrome: &
     r.pop_clip();
 }
 
-fn draw_status_bar(r: &mut Renderer, ed: &Editor, l: &Layout, p: &Palette) {
+fn draw_status_bar(r: &mut Renderer, ed: &Editor, l: &Layout, p: &Palette, chrome: &Chrome) {
     // The bar belongs to the editing area, so it starts right of the sidebar:
     // the sidebar's project card runs all the way to the bottom edge.
     let sx = l.sidebar_w;
@@ -312,6 +318,26 @@ fn draw_status_bar(r: &mut Renderer, ed: &Editor, l: &Layout, p: &Palette) {
     let pos = format!("Ln {}, Col {}", ed.cursor.line + 1, ed.cursor.col + 1);
     let px = (l.width - GUTTER_PAD - r.ui_text_width(&pos)).max(sx);
     r.text_ui(px, text_y, &pos, p.status_text);
+
+    // The updater's line sits left of the position, right-aligned so it grows
+    // toward the middle of the bar and never pushes the cursor position away.
+    if let Some(note) = chrome.update_note {
+        let nw = r.ui_text_width(note);
+        let mut nx = px - 16.0 - nw;
+        if chrome.update_badge {
+            // A tiny download mark: the tray, the stem and the arrow head, all
+            // rects so it looks the same at any font size.
+            let icon_x = nx - 13.0;
+            let iy = text_y + 1.0;
+            r.rect(icon_x + 2.0, iy, 2.0, 7.0, p.accent);
+            r.rect(icon_x + 1.0, iy + 5.0, 4.0, 2.0, p.accent);
+            r.rect(icon_x + 0.0, iy + 9.0, 6.0, 1.5, p.accent);
+            nx = icon_x - 5.0 - nw;
+        }
+        if nx > sx + 4.0 {
+            r.text_ui(nx, text_y, note, p.muted);
+        }
+    }
 }
 
 /// The part of `line` that is visible when scrolled `scroll_x` columns right.

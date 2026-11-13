@@ -4,9 +4,16 @@
 // opens with Ctrl+, or the sidebar footer, and closes with Esc or Ctrl+, again.
 // Every change is applied live and written straight back to the config file.
 //
-// The page is a title, a short hint, and eight rows. Each row is one of the
-// three widget types from `widgets.rs`. Keyboard: Up/Down select, Left/Right
-// change, Enter activates a toggle. Mouse: click any part of a control.
+// The lower half of the page (the updater rows and the privacy note) only
+// exists with the `updater` feature on. Keeping the list fixed per build means
+// drawing, hit testing and keyboard navigation stay in step: `Row::ALL` is
+// compiled, not filtered at run time.
+//
+// The page is a title, a short hint, and a fixed list of rows. Each row is one
+// of the widget types from `widgets.rs`, including the v1.2 action row (a
+// button that does something instead of holding a value). Keyboard: Up/Down
+// select, Left/Right change, Enter activates a toggle or an action. Mouse:
+// click any part of a control.
 
 use crate::config::{Buttons, Config, SidebarMode, Theme};
 use crate::render::Renderer;
@@ -28,10 +35,32 @@ pub enum Row {
     Sidebar,
     Theme,
     Animations,
+    #[cfg(feature = "updater")]
+    CheckUpdates,
+    #[cfg(feature = "updater")]
+    UpdateAction,
 }
 
 impl Row {
+    #[cfg(feature = "updater")]
+    pub const COUNT: usize = 11;
+    #[cfg(not(feature = "updater"))]
     pub const COUNT: usize = 9;
+    #[cfg(feature = "updater")]
+    pub const ALL: [Row; Row::COUNT] = [
+        Row::FontSize,
+        Row::TabWidth,
+        Row::LineNumbers,
+        Row::CursorBlink,
+        Row::WindowButtons,
+        Row::CornerRadius,
+        Row::Sidebar,
+        Row::Theme,
+        Row::Animations,
+        Row::CheckUpdates,
+        Row::UpdateAction,
+    ];
+    #[cfg(not(feature = "updater"))]
     pub const ALL: [Row; Row::COUNT] = [
         Row::FontSize,
         Row::TabWidth,
@@ -59,6 +88,10 @@ impl Row {
             Row::Sidebar => "Sidebar",
             Row::Theme => "Theme",
             Row::Animations => "Animations",
+            #[cfg(feature = "updater")]
+            Row::CheckUpdates => "Check for updates",
+            #[cfg(feature = "updater")]
+            Row::UpdateAction => "Update",
         }
     }
 }
@@ -119,6 +152,7 @@ pub fn draw(
     l: &Layout,
     p: &Palette,
     cfg: &Config,
+    update: &UpdateInfo,
     selected: usize,
     hover: Option<usize>,
 ) -> Geometry {
@@ -136,8 +170,14 @@ pub fn draw(
     for (i, row) in Row::ALL.iter().enumerate() {
         let y = geo.row_y(i);
         let focused = i == selected;
-        let widget = widget_for(*row, cfg);
-        let label = row.label();
+        let widget = widget_for(*row, cfg, update);
+        let label = match *row {
+            // The updater row explains itself: what is available, or what
+            // `Check now` will do. The action button carries the verb.
+            #[cfg(feature = "updater")]
+            Row::UpdateAction => update.label.as_str(),
+            other => other.label(),
+        };
 
         // A full-width hairline between rows keeps the page readable without
         // boxes.
@@ -155,6 +195,25 @@ pub fn draw(
             });
         }
     }
+
+    // Privacy note (v1.2 section 9): say exactly what leaves the machine,
+    // directly under the rows, because that is where the toggle is.
+    #[cfg(feature = "updater")]
+    {
+        let y = geo.row_y(Row::COUNT) + 14.0;
+        r.text_ui(
+            geo.x,
+            y,
+            "Updates check github.com once a day. No other data is sent.",
+            p.muted,
+        );
+        r.text_ui(
+            geo.x,
+            y + 16.0,
+            "With \"Check for updates\" off, no request is ever made.",
+            p.muted,
+        );
+    }
     geo
 }
 
@@ -164,15 +223,21 @@ pub fn draw(
 ///
 /// The pieces come from `RowGeom::spans`, the same source `RowGeom::part` uses,
 /// so the map and a point lookup can never disagree.
-pub fn register(map: &mut HitMap, l: &Layout, cfg: &Config) {
+pub fn register(map: &mut HitMap, l: &Layout, cfg: &Config, update: &UpdateInfo) {
     let geo = Geometry::new(l);
     // Panel background: drawn over the text area, so it swallows clicks there.
+    // The height includes the privacy note when the updater is on, otherwise a
+    // click on that text would fall through to the editor.
+    #[cfg(feature = "updater")]
+    let note_h = 40.0;
+    #[cfg(not(feature = "updater"))]
+    let note_h = 0.0;
     map.push(
         Rect::new(
             geo.x,
             geo.y,
             geo.w,
-            PAGE_H + Row::COUNT as f32 * widgets::ROW_H,
+            PAGE_H + Row::COUNT as f32 * widgets::ROW_H + note_h,
         ),
         Target::None,
     );
@@ -180,7 +245,7 @@ pub fn register(map: &mut HitMap, l: &Layout, cfg: &Config) {
     let geom = widgets::RowGeom { control_x };
     for i in 0..Row::COUNT {
         let row = Row::from_index(i);
-        let widget = widget_for(row, cfg);
+        let widget = widget_for(row, cfg, update);
         let y = geo.row_y(i);
         for (x, w, part) in geom.spans(&widget) {
             map.push(
@@ -196,7 +261,33 @@ pub fn register(map: &mut HitMap, l: &Layout, cfg: &Config) {
 
 /// The control a row shows, built from the config so drawing and changing
 /// cannot disagree.
-pub fn widget_for(row: Row, cfg: &Config) -> Widget<'static> {
+/// What the two updater rows say. Built by the app from its `UpdateState`, so
+/// this module never needs the updater feature or the network types.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UpdateInfo {
+    /// Left-hand label of the action row.
+    pub label: String,
+    /// Text on the action button.
+    pub action: String,
+    /// False while a check or download is already running.
+    pub enabled: bool,
+}
+
+impl Default for UpdateInfo {
+    fn default() -> Self {
+        Self {
+            label: "Check now".to_string(),
+            action: "Check now".to_string(),
+            enabled: true,
+        }
+    }
+}
+
+pub fn widget_for<'a>(row: Row, cfg: &Config, update: &'a UpdateInfo) -> Widget<'a> {
+    // Without the updater there is no row to build from it, but the signature
+    // stays the same so the callers do not need a feature check.
+    #[cfg(not(feature = "updater"))]
+    let _ = update;
     match row {
         Row::FontSize => Widget::Stepper(FONT_SIZES_TEXT[font_index(cfg)]),
         Row::TabWidth => Widget::Choice {
@@ -239,6 +330,14 @@ pub fn widget_for(row: Row, cfg: &Config) -> Widget<'static> {
             },
         },
         Row::Animations => Widget::Toggle(cfg.animations),
+        #[cfg(feature = "updater")]
+        Row::CheckUpdates => Widget::Toggle(cfg.check_updates),
+        // The button's text is the verb the state allows right now.
+        #[cfg(feature = "updater")]
+        Row::UpdateAction => Widget::Action {
+            label: update.action.as_str(),
+            enabled: update.enabled,
+        },
     }
 }
 
@@ -307,6 +406,11 @@ pub fn step(cfg: &mut Config, row: Row, delta: i32) -> bool {
             }
         }
         Row::Animations => cfg.animations = !cfg.animations,
+        #[cfg(feature = "updater")]
+        Row::CheckUpdates => cfg.check_updates = !cfg.check_updates,
+        // An action row changes no value; the app runs it.
+        #[cfg(feature = "updater")]
+        Row::UpdateAction => {}
     }
     *cfg != before
 }
@@ -344,6 +448,11 @@ pub fn choose(cfg: &mut Config, row: Row, index: usize) -> bool {
                 Theme::Light
             };
         }
+        // The action row has no segments to choose.
+        #[cfg(feature = "updater")]
+        Row::UpdateAction => return false,
+        #[cfg(feature = "updater")]
+        Row::CheckUpdates => return step(cfg, row, 1),
         // Toggles and steppers are not segment choices.
         Row::LineNumbers | Row::CursorBlink | Row::Animations | Row::FontSize => {
             return step(cfg, row, if index == 0 { -1 } else { 1 })
@@ -359,8 +468,10 @@ pub fn apply_part(cfg: &mut Config, row: Row, part: Option<usize>) -> bool {
     let Some(part) = part else {
         return false;
     };
-    match widget_for(row, cfg) {
+    match widget_for(row, cfg, &UpdateInfo::default()) {
         Widget::Toggle(_) => step(cfg, row, 1),
+        // An action is not a value: the app decides what clicking it means.
+        Widget::Action { .. } => false,
         Widget::Stepper(_) => match part {
             0 => step(cfg, row, -1),
             2 => step(cfg, row, 1),
@@ -378,15 +489,15 @@ mod tests {
     fn the_spec_defaults_are_reachable_from_the_rows() {
         let cfg = Config::default();
         assert!(matches!(
-            widget_for(Row::FontSize, &cfg),
+            widget_for(Row::FontSize, &cfg, &UpdateInfo::default()),
             Widget::Stepper("15")
         ));
         assert!(matches!(
-            widget_for(Row::LineNumbers, &cfg),
+            widget_for(Row::LineNumbers, &cfg, &UpdateInfo::default()),
             Widget::Toggle(true)
         ));
         assert!(matches!(
-            widget_for(Row::CursorBlink, &cfg),
+            widget_for(Row::CursorBlink, &cfg, &UpdateInfo::default()),
             Widget::Toggle(false)
         ));
     }
@@ -454,6 +565,59 @@ mod tests {
         assert_eq!(cfg.corner_radius, 0);
     }
 
+    #[cfg(feature = "updater")]
+    #[test]
+    fn the_updater_rows_are_the_last_two_and_toggle_the_setting() {
+        assert_eq!(Row::from_index(Row::COUNT - 2), Row::CheckUpdates);
+        assert_eq!(Row::from_index(Row::COUNT - 1), Row::UpdateAction);
+        // The toggle is a real setting: stepping it flips the config key.
+        let mut cfg = Config::default();
+        assert!(cfg.check_updates);
+        assert!(step(&mut cfg, Row::CheckUpdates, 1));
+        assert!(!cfg.check_updates);
+        assert!(apply_part(&mut cfg, Row::CheckUpdates, Some(0)));
+        assert!(cfg.check_updates);
+        // The action row never changes the config; the app runs it instead.
+        assert!(!step(&mut cfg, Row::UpdateAction, 1));
+        assert!(!apply_part(&mut cfg, Row::UpdateAction, Some(0)));
+        assert!(!choose(&mut cfg, Row::UpdateAction, 0));
+    }
+
+    #[cfg(feature = "updater")]
+    #[test]
+    fn the_action_button_says_what_the_state_allows() {
+        let cfg = Config::default();
+        let cases = [
+            ("Check now", true),
+            ("Download and install", true),
+            ("Restart", true),
+            ("Retry", true),
+        ];
+        for (action, enabled) in cases {
+            let info = UpdateInfo {
+                label: "Update available: v1.2.1".to_string(),
+                action: action.to_string(),
+                enabled,
+            };
+            match widget_for(Row::UpdateAction, &cfg, &info) {
+                Widget::Action { label, enabled: e } => {
+                    assert_eq!(label, action);
+                    assert_eq!(e, enabled);
+                }
+                _ => panic!("expected an action row"),
+            }
+        }
+        // A disabled action is not clickable at all: no piece to hit.
+        let info = UpdateInfo {
+            label: "Checking for updates…".to_string(),
+            action: "Checking…".to_string(),
+            enabled: false,
+        };
+        let geom = widgets::RowGeom { control_x: 0.0 };
+        let spans = geom.spans(&widget_for(Row::UpdateAction, &cfg, &info));
+        assert_eq!(spans.len(), 1, "one piece, so the cursor is a hand");
+    }
+
     #[test]
     fn rows_are_in_spec_order_and_have_labels() {
         assert_eq!(Row::from_index(0), Row::FontSize);
@@ -469,8 +633,9 @@ mod tests {
         for row in Row::ALL {
             let mut cfg = Config::default();
             // Toggles and steppers change with a step; choices with a choice.
-            let changed = match widget_for(row, &cfg) {
+            let changed = match widget_for(row, &cfg, &UpdateInfo::default()) {
                 Widget::Choice { .. } => choose(&mut cfg, row, 0) || choose(&mut cfg, row, 1),
+                Widget::Action { .. } => continue, // not a value row
                 _ => step(&mut cfg, row, 1) || step(&mut cfg, row, -1),
             };
             assert!(changed, "{row:?} did not change with any interaction");

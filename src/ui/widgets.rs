@@ -28,6 +28,14 @@ pub enum Widget<'a> {
         options: &'a [&'a str],
         index: usize,
     },
+    /// A button that does something instead of holding a value (v1.2 section
+    /// 10: "add one more, an action row for buttons like `Check now`").
+    /// `enabled` false draws it dimmed and makes the click do nothing.
+    ///
+    /// Only the updater's rows use it, so a `--no-default-features` build
+    /// compiles it without constructing one.
+    #[cfg_attr(not(feature = "updater"), allow(dead_code))]
+    Action { label: &'a str, enabled: bool },
 }
 
 /// Geometry of one drawn row, kept so hit testing matches the drawing.
@@ -53,6 +61,7 @@ impl RowGeom {
                 let x = self.control_x + CONTROL_W - STEP_W;
                 vec![(x, STEP_BTN, 0), (x + STEP_W - STEP_BTN, STEP_BTN, 2)]
             }
+            Widget::Action { .. } => vec![(self.control_x, CONTROL_W, 0)],
             Widget::Choice { options, .. } => {
                 let n = options.len().max(1);
                 let seg = CONTROL_W / n as f32;
@@ -112,6 +121,9 @@ pub fn draw_row(
         Widget::Choice { options, index } => {
             draw_choice(r, p, control_x, y, options, *index);
         }
+        Widget::Action { label, enabled } => {
+            draw_action(r, p, control_x, y, label, *enabled);
+        }
     }
     geom
 }
@@ -156,6 +168,23 @@ fn draw_choice(r: &mut Renderer, p: &Palette, x: f32, y: f32, options: &[&str], 
         let color = if i == index { p.text } else { p.muted };
         r.text_ui(tx, y + (ROW_H - 13.0) * 0.5, option, color);
     }
+}
+
+fn draw_action(r: &mut Renderer, p: &Palette, x: f32, y: f32, label: &str, enabled: bool) {
+    let h = 26.0;
+    let top = y + (ROW_H - h) * 0.5;
+    // Sized to the label plus padding, but never wider than the control column
+    // and never narrower than a comfortable click target.
+    let tw = r.ui_text_width(label);
+    let w = (tw + 28.0).clamp(88.0, CONTROL_W);
+    let bx = x + CONTROL_W - w;
+    let (fill, text) = if enabled {
+        (p.pill_active, p.text)
+    } else {
+        (p.pill_hover, p.muted)
+    };
+    r.rounded_rect(bx, top, w, h, 5.0, fill);
+    r.text_ui(bx + (w - tw) * 0.5, y + (ROW_H - 13.0) * 0.5, label, text);
 }
 
 /// The pill radius used behind focused rows (matches `theme::PILL_RADIUS`).

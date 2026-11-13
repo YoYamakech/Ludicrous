@@ -27,6 +27,11 @@ tree-sitter-python = { version = "0.25.0", optional = true }
 tree-sitter-json = { version = "0.24.8", optional = true }
 tree-sitter-toml-ng = { version = "0.7.0", optional = true }
 tree-sitter-md = { version = "0.5.4", optional = true }
+# The updater's HTTP client: blocking, no async runtime, rustls for TLS.
+# `default-features = false` drops gzip, which saves a dependency and is not
+# needed for a JSON body or a 1.5 MB binary.
+ureq = { version = "3.5.2", default-features = false, features = ["rustls"], optional = true }
+sha2 = { version = "0.10", optional = true }
 
 # Heavy, optional features. All on by default, so a plain `cargo build` is the
 # full editor; turn them off for a fast edit/compile loop on the old laptop:
@@ -50,7 +55,7 @@ syntax = [
     "dep:tree-sitter-md",
 ]
 lsp = []
-updater = []
+updater = ["dep:ureq", "dep:sha2"]
 dialogs = ["dep:rfd"]
 
 # Release: small and fast. A debug build is only for working on the code.

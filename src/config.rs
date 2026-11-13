@@ -57,6 +57,10 @@ pub struct Config {
     /// UI animations (sidebar width, smooth scrolling, hover fades). On by
     /// default; off makes every change instant and keeps the loop at `Wait`.
     pub animations: bool,
+    /// Ask GitHub for a newer release (v1.2 section 9). On by default; the
+    /// check is once a day, ten seconds after the first frame, and silent when
+    /// offline. Turning it off means no request is ever made.
+    pub check_updates: bool,
 }
 
 impl Default for Config {
@@ -72,6 +76,7 @@ impl Default for Config {
             theme: Theme::Dark,
             experimental_damage: false,
             animations: true,
+            check_updates: true,
         }
     }
 }
@@ -187,6 +192,11 @@ impl Config {
                     self.animations = v;
                 }
             }
+            "check_updates" => {
+                if let Some(v) = parse_bool(value) {
+                    self.check_updates = v;
+                }
+            }
             _ => {} // unknown keys are forward compatible by design
         }
     }
@@ -205,7 +215,8 @@ impl Config {
              sidebar = {}\n\
              theme = {}\n\
              experimental_damage = {}\n\
-             animations = {}\n",
+             animations = {}\n\
+             check_updates = {}\n",
             self.font_size,
             self.tab_width,
             self.show_line_numbers,
@@ -227,6 +238,7 @@ impl Config {
             },
             self.experimental_damage,
             self.animations,
+            self.check_updates,
         )
     }
 
@@ -293,6 +305,9 @@ pub struct WindowState {
     /// The sidebar mode actually showing when the window closed. `None` means
     /// "no manual choice", which is also what `auto` in the config uses.
     pub sidebar: Option<SidebarMode>,
+    /// Unix timestamp of the last update check. At most one check per 24 h, so
+    /// this is what stops a restart loop from hammering GitHub.
+    pub last_update_check: Option<u64>,
 }
 
 impl Default for WindowState {
@@ -303,6 +318,7 @@ impl Default for WindowState {
             height: 700.0,
             maximized: false,
             sidebar: None,
+            last_update_check: None,
         }
     }
 }
@@ -361,6 +377,13 @@ impl WindowState {
                     self.maximized = v;
                 }
             }
+            "last_update_check" => {
+                // 0 is what `to_text` writes for "never checked": a check in
+                // 1970 must not make the next one wait until 1971.
+                if let Ok(v) = value.parse::<u64>() {
+                    self.last_update_check = (v > 0).then_some(v);
+                }
+            }
             "sidebar" => {
                 self.sidebar = match value {
                     "expanded" => Some(SidebarMode::Expanded),
@@ -373,10 +396,9 @@ impl WindowState {
         }
     }
 
-    pub fn save(&self) {
-        let Some(path) = Self::path() else {
-            return;
-        };
+    /// The state file's contents. Split out from `save` so a test can round
+    /// trip it without touching the real state directory.
+    pub fn to_text(self) -> String {
         let sidebar = match self.sidebar {
             None => "auto",
             Some(SidebarMode::Auto) => "auto",
@@ -384,14 +406,23 @@ impl WindowState {
             Some(SidebarMode::Rail) => "rail",
             Some(SidebarMode::Hidden) => "hidden",
         };
-        let text = format!(
-            "# Ludicrous window state\nwidth = {}\nheight = {}\nmaximized = {}\nsidebar = {}\n",
+        format!(
+            "# Ludicrous window state\nwidth = {}\nheight = {}\nmaximized = {}\nsidebar = {}\nlast_update_check = {}\n",
             self.width.round() as i64,
             self.height.round() as i64,
             self.maximized,
-            sidebar
-        );
-        if let Err(e) = safe_write(&path, &text) {
+            sidebar,
+            self.last_update_check
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "0".to_string())
+        )
+    }
+
+    pub fn save(&self) {
+        let Some(path) = Self::path() else {
+            return;
+        };
+        if let Err(e) = safe_write(&path, &self.to_text()) {
             eprintln!("ludicrous: could not save window state: {e}");
         }
     }
@@ -415,6 +446,44 @@ mod tests {
     }
 
     #[test]
+    fn checking_for_updates_is_on_unless_turned_off() {
+        // On by default: the spec's default column (v1.2 section 10).
+        assert!(Config::default().check_updates);
+        assert!(!Config::parse("check_updates = off\n").check_updates);
+        assert!(Config::parse("check_updates = on\n").check_updates);
+        // Garbage keeps the default rather than silently disabling updates.
+        assert!(Config::parse("check_updates = maybe\n").check_updates);
+        // And it survives a save/load round trip.
+        let c = Config {
+            check_updates: false,
+            ..Config::default()
+        };
+        assert!(!Config::parse(&c.to_text()).check_updates);
+    }
+
+    #[test]
+    fn the_last_update_check_is_in_the_state_file() {
+        let mut st = WindowState::default();
+        assert_eq!(st.last_update_check, None);
+        st.last_update_check = Some(1_700_000_000);
+        let text = st.to_text();
+        assert!(text.contains("last_update_check = 1700000000"));
+        assert_eq!(
+            WindowState::parse(&text).last_update_check,
+            Some(1_700_000_000)
+        );
+        // Zero (as written for "never") parses back to `None`, not 1970.
+        assert_eq!(
+            WindowState::parse("last_update_check = 0\n").last_update_check,
+            None
+        );
+        assert_eq!(
+            WindowState::parse("last_update_check = soon\n").last_update_check,
+            None
+        );
+    }
+
+    #[test]
     fn every_key_round_trips_through_text() {
         let c = Config {
             font_size: 22,
@@ -427,6 +496,7 @@ mod tests {
             theme: Theme::Light,
             experimental_damage: true,
             animations: false,
+            check_updates: false,
         };
         assert_eq!(Config::parse(&c.to_text()), c);
     }
