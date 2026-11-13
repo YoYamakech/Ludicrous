@@ -1,5 +1,5 @@
 #version 330 core
-// Per-instance: rect (x, y, w, h), color, params (radius, border, -, -),
+// Per-instance: rect (x, y, w, h), color, params (radius, border, style, -),
 // clip rect (x, y, w, h). All in physical pixels, top-left origin.
 layout(location = 0) in vec2 a_corner;   // unit quad, 0..1
 layout(location = 1) in vec4 a_rect;

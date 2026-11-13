@@ -381,6 +381,48 @@ impl Renderer {
         self.shape(x, y, w, h, 0.0, 0.0, color);
     }
 
+    /// A wavy underline across `w` points at `y`, `h` points tall (v1.2
+    /// section 7.3). Same batch, same program, one instance: the shader's
+    /// `params.z` switches to the wave, so a squiggle costs exactly what a rect
+    /// costs and never adds a draw call.
+    pub fn squiggle(&mut self, x: f32, y: f32, w: f32, h: f32, color: Color) {
+        let s = self.scale;
+        if w * s < 1.0 || h * s < 2.0 || color[3] <= 0.0 {
+            return;
+        }
+        // Drawn over text, so it belongs in the over-text batch when it lands
+        // on pending glyphs (and only then: an empty line's squiggle does not
+        // need a flush).
+        let over = self.covers_pending_text(x, y, w, h);
+        let clip = self.current_clip();
+        if over {
+            self.over_boxes.push([x * s, y * s, w * s, h * s]);
+        }
+        let batch = if over {
+            &mut self.rects_over
+        } else {
+            &mut self.rects
+        };
+        batch.push(&[
+            x * s,
+            y * s,
+            w * s,
+            h * s,
+            color[0],
+            color[1],
+            color[2],
+            color[3],
+            0.0,
+            0.0,
+            1.0, // style: squiggle
+            0.0,
+            clip[0],
+            clip[1],
+            clip[2],
+            clip[3],
+        ]);
+    }
+
     /// Filled rectangle with rounded corners (radius in points).
     #[allow(dead_code)] // shell chrome (Phase B+)
     pub fn rounded_rect(&mut self, x: f32, y: f32, w: f32, h: f32, radius: f32, color: Color) {
@@ -551,7 +593,7 @@ impl Renderer {
             color[3],
             radius * s,
             border * s,
-            0.0,
+            0.0, // style: plain fill or border
             0.0,
             clip[0],
             clip[1],

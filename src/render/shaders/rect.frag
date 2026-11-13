@@ -28,7 +28,17 @@ void main() {
     float d = sd_round_box(v_local - v_size * 0.5, v_size * 0.5, radius);
 
     float cov;
-    if (v_params.y > 0.0) {
+    if (v_params.z > 0.5) {
+        // Squiggle (v1.2 section 7.3): a wavy underline instead of a filled
+        // box, so diagnostics need no second program and no extra draw call.
+        // One period is ~6 physical pixels, which reads as a wave at 100% DPI
+        // and stays a wave (not a blur) at 200%.
+        float period = 6.0;
+        float wave = sin((v_px.x / period) * 6.2831853) * 1.5;
+        float centre = v_size.y * 0.5 - 0.5 + wave;
+        float dist = abs(v_local.y - centre) - 0.9;
+        cov = 1.0 - smoothstep(-0.5, 0.9, dist);
+    } else if (v_params.y > 0.0) {
         // Border drawn inside the shape: keep the band -width..0.
         float ring = abs(d + v_params.y * 0.5) - v_params.y * 0.5;
         cov = 1.0 - smoothstep(-0.5, 0.5, ring);
