@@ -43,6 +43,20 @@ impl Buffer {
         }
     }
 
+    /// A buffer that did not come from a file. Used by the tests, and by the
+    /// LSP layer when it needs a view of text it has already read.
+    #[allow(dead_code)] // the LSP layer converts positions against a snapshot
+    pub fn from_text(text: &str) -> Self {
+        Self {
+            rope: Rope::from_str(text),
+            path: None,
+            modified: false,
+            line_ending: LineEnding::Lf,
+            version: 1,
+            last_edit: None,
+        }
+    }
+
     pub fn open(path: &Path) -> io::Result<Self> {
         let bytes = std::fs::read(path)?;
         // Refuse anything that is not UTF-8 instead of mangling it: a lossy

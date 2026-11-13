@@ -11,6 +11,17 @@ mod app;
 mod config;
 mod editor;
 mod input;
+// Language servers are behind the `lsp` feature. The whole subtree is pure
+// std plus JSON: no winit, no GL (v1.2 section 7.1).
+//
+// The stub keeps the two model files UI drawing needs (diagnostic ranges and
+// their conversion), so a `--no-default-features` build has the same view code
+// with an always-empty store instead of a second copy of the drawing.
+#[cfg(feature = "lsp")]
+mod lsp;
+#[cfg(not(feature = "lsp"))]
+#[path = "lsp/stub.rs"]
+mod lsp;
 mod render;
 mod ui;
 mod updater;

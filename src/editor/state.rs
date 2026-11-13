@@ -58,6 +58,10 @@ pub struct Editor {
     /// True once we have tried to build a highlighter, so a failed attempt does
     /// not repeat on every frame.
     highlight_tried: bool,
+    /// The most recent edit as `(start, removed, added)` in characters, kept
+    /// for the language server. `Buffer::last_edit` cannot serve both: the
+    /// highlighter consumes it, and the LSP layer needs it after `apply`.
+    pub last_change: Option<(usize, usize, usize)>,
 }
 
 impl Editor {
@@ -76,6 +80,7 @@ impl Editor {
             indent: INDENT_WIDTH,
             highlight: None,
             highlight_tried: false,
+            last_change: None,
         }
     }
 
@@ -350,6 +355,8 @@ impl Editor {
         // syntax tree is updated here too: one place, before and after, and the
         // highlighter never has to know which command ran.
         let control = self.apply_inner(cmd);
+        // Copy before the highlighter takes the buffer's own record.
+        self.last_change = self.buffer.last_edit;
         self.sync_highlight_edit();
         control
     }

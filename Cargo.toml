@@ -32,6 +32,12 @@ tree-sitter-md = { version = "0.5.4", optional = true }
 # needed for a JSON body or a 1.5 MB binary.
 ureq = { version = "3.5.2", default-features = false, features = ["rustls"], optional = true }
 sha2 = { version = "0.10", optional = true }
+# LSP client (section 7). JSON only, no async: the protocol is Content-Length
+# framed JSON-RPC over the server's stdin/stdout, which serde_json handles.
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+# The protocol's type definitions, used to parse what servers send.
+lsp-types = { version = "0.97", optional = true }
 
 # Heavy, optional features. All on by default, so a plain `cargo build` is the
 # full editor; turn them off for a fast edit/compile loop on the old laptop:
@@ -54,7 +60,7 @@ syntax = [
     "dep:tree-sitter-toml-ng",
     "dep:tree-sitter-md",
 ]
-lsp = []
+lsp = ["dep:serde", "dep:serde_json", "dep:lsp-types"]
 updater = ["dep:ureq", "dep:sha2"]
 dialogs = ["dep:rfd"]
 
