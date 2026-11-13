@@ -19,6 +19,7 @@ pub mod theme {
     pub const STATUS_TEXT: Color = [0.72, 0.76, 0.82, 1.0];
     pub const MODIFIED: Color = [0.95, 0.70, 0.30, 1.0];
     pub const ERROR: Color = [0.95, 0.45, 0.40, 1.0];
+    pub const SELECTION: Color = [0.20, 0.32, 0.48, 1.0];
 }
 
 const GUTTER_PAD: f32 = 8.0;
@@ -53,6 +54,20 @@ pub fn draw(r: &mut Renderer, ed: &Editor, l: &Layout) {
         r.text(nx, y, num, theme::GUTTER_TEXT);
 
         let line = ed.buffer.line(idx);
+        // Selection highlight goes behind the text of this line.
+        if let Some((start, end)) = ed.selection() {
+            let line_start = ed.buffer.char_index(idx, 0);
+            let line_end = line_start + line.chars().count();
+            let a = start.max(line_start);
+            let b = end.min(line_end);
+            if a < b {
+                let (from, to) = (a - line_start, b - line_start);
+                let x0 = r.text_pen_x(l.text_x, &line, from);
+                let x1 = r.text_pen_x(l.text_x, &line, to);
+                let sx = x0 - (r.text_pen_x(l.text_x, &line, ed.scroll_x) - l.text_x);
+                r.rect(sx, y, x1 - x0, l.cell_h, theme::SELECTION);
+            }
+        }
         // Only the visible columns are laid out: a 100,000-character line
         // costs the same as a short one.
         let visible = visible_slice(&line, ed.scroll_x, l.cols);

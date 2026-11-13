@@ -108,19 +108,38 @@ impl History {
                 cursor_before: before,
                 cursor_after: after,
             });
-            if self.undo.len() > MAX_ENTRIES {
-                self.undo.remove(0);
-                // The saved state may have just fallen off the bottom.
-                self.saved = match self.saved {
-                    Some(0) => None,
-                    Some(n) => Some(n - 1),
-                    None => None,
-                };
-            }
+            self.trim();
         }
 
         self.last_at = Some(now);
         self.last_kind = Some(kind);
+    }
+
+    /// Record a whole entry at once, never merged with the previous one. Used
+    /// when one user action is several edits (replacing a selection: delete
+    /// the old text, insert the new).
+    pub fn record_entry(&mut self, edits: Vec<Edit>, before: Cursor, after: Cursor) {
+        self.redo.clear();
+        self.undo.push(HistoryEntry {
+            edits,
+            cursor_before: before,
+            cursor_after: after,
+        });
+        self.trim();
+        self.break_group();
+    }
+
+    /// Drop the oldest entries beyond the cap, keeping `saved` pointing at the
+    /// same state (or `None` once that state has fallen off the bottom).
+    fn trim(&mut self) {
+        while self.undo.len() > MAX_ENTRIES {
+            self.undo.remove(0);
+            self.saved = match self.saved {
+                Some(0) => None,
+                Some(n) => Some(n - 1),
+                None => None,
+            };
+        }
     }
 
     /// Move the newest entry to the redo stack and hand it back so the caller

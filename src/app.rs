@@ -18,7 +18,7 @@ use winit::keyboard::ModifiersState;
 use winit::raw_window_handle::HasWindowHandle;
 use winit::window::{Window, WindowId};
 
-use crate::editor::{Buffer, Control, Editor};
+use crate::editor::{Buffer, Command, Control, Editor};
 use crate::input;
 use crate::render::Renderer;
 use crate::ui::layout::Layout;
@@ -41,6 +41,9 @@ pub struct App {
     gl: Option<GlState>,
     editor: Option<Editor>,
     mods: ModifiersState,
+    /// Created on first use: opening the X11/Wayland clipboard at startup
+    /// would slow cold start and can fail on a headless machine.
+    clipboard: Option<arboard::Clipboard>,
 }
 
 impl App {
@@ -51,7 +54,59 @@ impl App {
             gl: None,
             editor: None,
             mods: ModifiersState::empty(),
+            clipboard: None,
         }
+    }
+
+    /// Copy the current selection to the system clipboard. Failures become a
+    /// status message, never a panic.
+    fn copy_selection(&mut self) {
+        let Some(ed) = self.editor.as_mut() else {
+            return;
+        };
+        let Some(text) = ed.selected_text() else {
+            ed.status = Some("Nothing selected".to_string());
+            return;
+        };
+        if self.clipboard.is_none() {
+            match arboard::Clipboard::new() {
+                Ok(c) => self.clipboard = Some(c),
+                Err(e) => {
+                    ed.status = Some(format!("Clipboard unavailable: {e}"));
+                    return;
+                }
+            }
+        }
+        if let Some(c) = self.clipboard.as_mut() {
+            if let Err(e) = c.set_text(text) {
+                ed.status = Some(format!("Copy failed: {e}"));
+            }
+        }
+    }
+
+    /// Read the clipboard and hand it to the editor as one paste command.
+    fn paste(&mut self) {
+        let Some(ed) = self.editor.as_mut() else {
+            return;
+        };
+        if self.clipboard.is_none() {
+            match arboard::Clipboard::new() {
+                Ok(c) => self.clipboard = Some(c),
+                Err(e) => {
+                    ed.status = Some(format!("Clipboard unavailable: {e}"));
+                    return;
+                }
+            }
+        }
+        let text = match self.clipboard.as_mut().map(|c| c.get_text()) {
+            Some(Ok(t)) => t,
+            Some(Err(e)) => {
+                ed.status = Some(format!("Paste failed: {e}"));
+                return;
+            }
+            None => return,
+        };
+        ed.apply(Command::Paste(text));
     }
 
     /// Create the window, then the GL context and surface.
@@ -200,9 +255,21 @@ impl ApplicationHandler for App {
                 if event.state != ElementState::Pressed {
                     return;
                 }
+                // Clipboard commands need the app, not just the editor.
+                if input::is_paste(&event, self.mods) {
+                    self.paste();
+                    if let Some(w) = self.window.as_ref() {
+                        w.request_redraw();
+                    }
+                    return;
+                }
                 let Some(cmd) = input::key(&event, self.mods) else {
                     return;
                 };
+                // Copy/Cut read the selection before the editor changes it.
+                if matches!(cmd, Command::Copy | Command::Cut) {
+                    self.copy_selection();
+                }
                 let Some(ed) = self.editor.as_mut() else {
                     return;
                 };

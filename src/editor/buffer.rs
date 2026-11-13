@@ -109,6 +109,13 @@ impl Buffer {
         }
     }
 
+    /// Line and column (both 0-based, in characters) of a character index.
+    pub fn line_col_of(&self, i: usize) -> (usize, usize) {
+        let i = i.min(self.rope.len_chars());
+        let line = self.rope.char_to_line(i);
+        (line, i - self.rope.line_to_char(line))
+    }
+
     /// Insert a whole string at a character index (used by undo/redo).
     pub fn insert_str_at(&mut self, i: usize, text: &str) {
         self.rope.insert(i, text);

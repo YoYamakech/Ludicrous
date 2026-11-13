@@ -42,6 +42,9 @@ pub struct Editor {
     quit_armed: Option<Instant>,
     /// Undo/redo stacks. Also the source of truth for "is this file dirty?".
     pub history: History,
+    /// Where a shift-selection started. `None` means nothing is selected; the
+    /// selection is always the range between this and the cursor.
+    pub anchor: Option<Cursor>,
 }
 
 impl Editor {
@@ -56,7 +59,85 @@ impl Editor {
             status: None,
             quit_armed: None,
             history: History::new(),
+            anchor: None,
         }
+    }
+
+    /// The selected range as `(start, end)` character indices, or `None` when
+    /// nothing is selected. `start` is always before `end`.
+    pub fn selection(&self) -> Option<(usize, usize)> {
+        let anchor = self.anchor?;
+        let a = self.buffer.char_index(anchor.line, anchor.col);
+        let b = self.buffer.char_index(self.cursor.line, self.cursor.col);
+        if a == b {
+            None
+        } else if a < b {
+            Some((a, b))
+        } else {
+            Some((b, a))
+        }
+    }
+
+    /// The selected text, for the clipboard.
+    pub fn selected_text(&self) -> Option<String> {
+        let (start, end) = self.selection()?;
+        Some(self.buffer.rope.slice(start..end).to_string())
+    }
+
+    /// Delete the selection as one undoable step and return the removed text.
+    fn delete_selection(&mut self) -> Option<String> {
+        let (start, end) = self.selection()?;
+        let text = self.buffer.rope.slice(start..end).to_string();
+        let before = self.cursor;
+        self.buffer.remove_at(start, end - start);
+        // Put the cursor where the selection began.
+        let (line, col) = self.buffer.line_col_of(start);
+        self.cursor.line = line;
+        self.cursor.col = col;
+        self.cursor.desired_col = col;
+        self.anchor = None;
+        self.history.record_entry(
+            vec![Edit::Delete {
+                pos: start,
+                text: text.clone(),
+            }],
+            before,
+            self.cursor,
+        );
+        Some(text)
+    }
+
+    /// Replace the selection (or the cursor position) with `text` as one
+    /// undoable step. Used by typing, paste and cut.
+    pub fn insert_text(&mut self, text: &str) {
+        let before = self.cursor;
+        let mut edits = Vec::new();
+        if let Some((start, end)) = self.selection() {
+            let removed = self.buffer.rope.slice(start..end).to_string();
+            self.buffer.remove_at(start, end - start);
+            let (line, col) = self.buffer.line_col_of(start);
+            self.cursor.line = line;
+            self.cursor.col = col;
+            edits.push(Edit::Delete {
+                pos: start,
+                text: removed,
+            });
+        }
+        self.anchor = None;
+        let pos = self.buffer.char_index(self.cursor.line, self.cursor.col);
+        self.buffer.insert_str_at(pos, text);
+        edits.push(Edit::Insert {
+            pos,
+            text: text.to_string(),
+        });
+        // Move the cursor to the end of what was inserted.
+        let end = pos + text.chars().count();
+        let (line, col) = self.buffer.line_col_of(end);
+        self.cursor.line = line;
+        self.cursor.col = col;
+        self.cursor.desired_col = col;
+        self.history.record_entry(edits, before, self.cursor);
+        self.sync_modified();
     }
 
     /// True when the text differs from the last saved version.
@@ -88,6 +169,59 @@ impl Editor {
         Control::Continue
     }
 
+    /// Start a cursor movement. `extend` keeps (or starts) a selection.
+    fn begin_move(&mut self, extend: bool) {
+        self.history.break_group();
+        if extend {
+            if self.anchor.is_none() {
+                self.anchor = Some(self.cursor);
+            }
+        } else {
+            self.anchor = None;
+        }
+    }
+
+    fn move_left(&mut self) {
+        if self.cursor.col > 0 {
+            self.cursor.col -= 1;
+        } else if self.cursor.line > 0 {
+            self.cursor.line -= 1;
+            self.cursor.col = self.buffer.line_len(self.cursor.line);
+        }
+        self.cursor.desired_col = self.cursor.col;
+    }
+
+    fn move_right(&mut self) {
+        if self.cursor.col < self.buffer.line_len(self.cursor.line) {
+            self.cursor.col += 1;
+        } else if self.cursor.line + 1 < self.buffer.line_count() {
+            self.cursor.line += 1;
+            self.cursor.col = 0;
+        }
+        self.cursor.desired_col = self.cursor.col;
+    }
+
+    fn move_up(&mut self) {
+        if self.cursor.line > 0 {
+            self.cursor.line -= 1;
+            // Aim for the remembered column, not the clamped one.
+            self.cursor.col = self
+                .cursor
+                .desired_col
+                .min(self.buffer.line_len(self.cursor.line));
+        }
+    }
+
+    fn move_down(&mut self) {
+        if self.cursor.line + 1 < self.buffer.line_count() {
+            self.cursor.line += 1;
+            self.cursor.col = self
+                .cursor
+                .desired_col
+                .min(self.buffer.line_len(self.cursor.line));
+        }
+    }
+
     pub fn apply(&mut self, cmd: Command) -> Control {
         // A status message only describes the command that produced it, so any
         // new command clears it first. Any key other than Ctrl+Q also cancels a
@@ -100,6 +234,11 @@ impl Editor {
             Command::Insert(ch) => {
                 if ch == '\n' || ch == '\r' {
                     return self.apply(Command::Newline);
+                }
+                // Typing over a selection replaces it in one undo step.
+                if self.selection().is_some() {
+                    self.insert_text(&ch.to_string());
+                    return Control::Continue;
                 }
                 let before = self.cursor;
                 let (l, c) = (self.cursor.line, self.cursor.col);
@@ -119,6 +258,10 @@ impl Editor {
                 );
             }
             Command::Newline => {
+                if self.selection().is_some() {
+                    self.insert_text("\n");
+                    return Control::Continue;
+                }
                 let before = self.cursor;
                 let pos = self.buffer.char_index(self.cursor.line, self.cursor.col);
                 let (l, c) = self
@@ -139,6 +282,10 @@ impl Editor {
                 );
             }
             Command::Backspace => {
+                if self.selection().is_some() {
+                    self.delete_selection();
+                    return Control::Continue;
+                }
                 let before = self.cursor;
                 // Work out what is about to disappear before deleting it, so
                 // the history entry can put exactly that text back.
@@ -169,6 +316,10 @@ impl Editor {
                 }
             }
             Command::Delete => {
+                if self.selection().is_some() {
+                    self.delete_selection();
+                    return Control::Continue;
+                }
                 let before = self.cursor;
                 let (l, c) = (self.cursor.line, self.cursor.col);
                 let removed = self.buffer.char_at(self.buffer.char_index(l, c));
@@ -219,59 +370,34 @@ impl Editor {
                     self.cursor = entry.cursor_after;
                 }
             }
-            Command::Left => {
-                self.history.break_group();
-                if self.cursor.col > 0 {
-                    self.cursor.col -= 1;
-                } else if self.cursor.line > 0 {
-                    self.cursor.line -= 1;
-                    self.cursor.col = self.buffer.line_len(self.cursor.line);
-                }
-                self.cursor.desired_col = self.cursor.col;
+            Command::Left | Command::SelectLeft => {
+                self.begin_move(matches!(cmd, Command::SelectLeft));
+                self.move_left();
             }
-            Command::Right => {
-                self.history.break_group();
-                if self.cursor.col < self.buffer.line_len(self.cursor.line) {
-                    self.cursor.col += 1;
-                } else if self.cursor.line + 1 < self.buffer.line_count() {
-                    self.cursor.line += 1;
-                    self.cursor.col = 0;
-                }
-                self.cursor.desired_col = self.cursor.col;
+            Command::Right | Command::SelectRight => {
+                self.begin_move(matches!(cmd, Command::SelectRight));
+                self.move_right();
             }
-            Command::Up => {
-                self.history.break_group();
-                if self.cursor.line > 0 {
-                    self.cursor.line -= 1;
-                    // Aim for the remembered column, not the clamped one.
-                    self.cursor.col = self
-                        .cursor
-                        .desired_col
-                        .min(self.buffer.line_len(self.cursor.line));
-                }
+            Command::Up | Command::SelectUp => {
+                self.begin_move(matches!(cmd, Command::SelectUp));
+                self.move_up();
             }
-            Command::Down => {
-                self.history.break_group();
-                if self.cursor.line + 1 < self.buffer.line_count() {
-                    self.cursor.line += 1;
-                    self.cursor.col = self
-                        .cursor
-                        .desired_col
-                        .min(self.buffer.line_len(self.cursor.line));
-                }
+            Command::Down | Command::SelectDown => {
+                self.begin_move(matches!(cmd, Command::SelectDown));
+                self.move_down();
             }
-            Command::Home => {
-                self.history.break_group();
+            Command::Home | Command::SelectHome => {
+                self.begin_move(matches!(cmd, Command::SelectHome));
                 self.cursor.col = 0;
                 self.cursor.desired_col = 0;
             }
-            Command::End => {
-                self.history.break_group();
+            Command::End | Command::SelectEnd => {
+                self.begin_move(matches!(cmd, Command::SelectEnd));
                 self.cursor.col = self.buffer.line_len(self.cursor.line);
                 self.cursor.desired_col = self.cursor.col;
             }
             Command::PageUp => {
-                self.history.break_group();
+                self.begin_move(false);
                 self.cursor.line = self.cursor.line.saturating_sub(self.rows.max(1));
                 self.cursor.col = self
                     .cursor
@@ -279,13 +405,41 @@ impl Editor {
                     .min(self.buffer.line_len(self.cursor.line));
             }
             Command::PageDown => {
-                self.history.break_group();
+                self.begin_move(false);
                 let last = self.buffer.line_count().saturating_sub(1);
                 self.cursor.line = (self.cursor.line + self.rows.max(1)).min(last);
                 self.cursor.col = self
                     .cursor
                     .desired_col
                     .min(self.buffer.line_len(self.cursor.line));
+            }
+            Command::SelectAll => {
+                self.history.break_group();
+                self.anchor = Some(Cursor::new());
+                let last = self.buffer.line_count().saturating_sub(1);
+                self.cursor.line = last;
+                self.cursor.col = self.buffer.line_len(last);
+                self.cursor.desired_col = self.cursor.col;
+            }
+            Command::Copy => {
+                // The app reads `selected_text()` and talks to the clipboard;
+                // the editor only reports what is selected.
+                if self.selection().is_none() {
+                    self.status = Some("Nothing selected".to_string());
+                }
+            }
+            Command::Cut => {
+                if self.selection().is_none() {
+                    self.status = Some("Nothing selected".to_string());
+                }
+                // The app copies `selected_text()` first, then this deletes it.
+                self.delete_selection();
+            }
+            Command::Paste(text) => {
+                if text.is_empty() {
+                    return Control::Continue;
+                }
+                self.insert_text(&text);
             }
             Command::Scroll(lines) => {
                 // Fractional values accumulate in `scroll` as whole lines only;
@@ -561,6 +715,67 @@ mod tests {
         ed.apply(Command::Home);
         ed.ensure_visible(10, 20);
         assert_eq!(ed.scroll_x, 0);
+    }
+
+    #[test]
+    fn shift_movement_selects_and_plain_movement_clears() {
+        let mut ed = editor("hello");
+        ed.apply(Command::SelectRight);
+        ed.apply(Command::SelectRight);
+        assert_eq!(ed.selection(), Some((0, 2)));
+        assert_eq!(ed.selected_text().as_deref(), Some("he"));
+        ed.apply(Command::Right);
+        assert_eq!(ed.selection(), None);
+    }
+
+    #[test]
+    fn select_all_covers_the_whole_buffer() {
+        let mut ed = editor("ab\ncd");
+        ed.apply(Command::SelectAll);
+        assert_eq!(ed.selected_text().as_deref(), Some("ab\ncd"));
+    }
+
+    #[test]
+    fn typing_over_a_selection_replaces_it_in_one_undo_step() {
+        let mut ed = editor("hello world");
+        ed.apply(Command::SelectAll);
+        ed.apply(Command::Insert('x'));
+        assert_eq!(ed.buffer.line(0), "x");
+        ed.apply(Command::Undo);
+        assert_eq!(ed.buffer.line(0), "hello world");
+    }
+
+    #[test]
+    fn paste_is_one_undo_step_and_handles_multibyte_text() {
+        let mut ed = editor("ab");
+        ed.apply(Command::End);
+        ed.apply(Command::Paste("é日🙂\nnext".to_string()));
+        assert_eq!(ed.buffer.line(0), "abé日🙂");
+        assert_eq!(ed.buffer.line(1), "next");
+        assert_eq!((ed.cursor.line, ed.cursor.col), (1, 4));
+        ed.apply(Command::Undo);
+        assert_eq!(ed.buffer.line(0), "ab");
+        assert_eq!(ed.buffer.line_count(), 1);
+    }
+
+    #[test]
+    fn cut_removes_the_selection_and_undo_restores_it() {
+        let mut ed = editor("one two");
+        ed.apply(Command::SelectAll);
+        ed.apply(Command::Cut);
+        assert_eq!(ed.buffer.line(0), "");
+        ed.apply(Command::Undo);
+        assert_eq!(ed.buffer.line(0), "one two");
+    }
+
+    #[test]
+    fn backspace_with_a_selection_deletes_only_the_selection() {
+        let mut ed = editor("abcdef");
+        ed.apply(Command::SelectRight);
+        ed.apply(Command::SelectRight);
+        ed.apply(Command::Backspace);
+        assert_eq!(ed.buffer.line(0), "cdef");
+        assert_eq!((ed.cursor.line, ed.cursor.col), (0, 0));
     }
 
     #[test]

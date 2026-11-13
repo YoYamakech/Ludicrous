@@ -1,7 +1,7 @@
 // command.rs: every edit or movement is one of these values.
 // Input never touches the buffer directly; it only produces Commands.
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Command {
     Insert(char),
     Newline,
@@ -13,6 +13,18 @@ pub enum Command {
     Down,
     Home,
     End,
+    /// Same movements, but extending the selection instead of clearing it.
+    SelectLeft,
+    SelectRight,
+    SelectUp,
+    SelectDown,
+    SelectHome,
+    SelectEnd,
+    SelectAll,
+    Copy,
+    Cut,
+    /// Paste text from the system clipboard (the app reads it, not the editor).
+    Paste(String),
     PageUp,
     PageDown,
     /// Scroll by a number of lines (positive = down).

@@ -18,16 +18,29 @@ pub fn key(event: &KeyEvent, mods: ModifiersState) -> Option<Command> {
                 "z" if mods.shift_key() => Some(Command::Redo),
                 "z" => Some(Command::Undo),
                 "y" => Some(Command::Redo),
+                "a" => Some(Command::SelectAll),
+                "c" => Some(Command::Copy),
+                "x" => Some(Command::Cut),
+                // Paste needs the clipboard, which only the app can read, so
+                // it is handled there; returning None keeps this pure.
                 _ => None,
             },
             _ => None,
         };
     }
 
+    // Shift+movement extends the selection; plain movement clears it.
+    let shift = mods.shift_key();
     match &event.logical_key {
         Key::Named(NamedKey::Enter) => Some(Command::Newline),
         Key::Named(NamedKey::Backspace) => Some(Command::Backspace),
         Key::Named(NamedKey::Delete) => Some(Command::Delete),
+        Key::Named(NamedKey::ArrowLeft) if shift => Some(Command::SelectLeft),
+        Key::Named(NamedKey::ArrowRight) if shift => Some(Command::SelectRight),
+        Key::Named(NamedKey::ArrowUp) if shift => Some(Command::SelectUp),
+        Key::Named(NamedKey::ArrowDown) if shift => Some(Command::SelectDown),
+        Key::Named(NamedKey::Home) if shift => Some(Command::SelectHome),
+        Key::Named(NamedKey::End) if shift => Some(Command::SelectEnd),
         Key::Named(NamedKey::ArrowLeft) => Some(Command::Left),
         Key::Named(NamedKey::ArrowRight) => Some(Command::Right),
         Key::Named(NamedKey::ArrowUp) => Some(Command::Up),
@@ -48,6 +61,14 @@ pub fn key(event: &KeyEvent, mods: ModifiersState) -> Option<Command> {
         }
         _ => None,
     }
+}
+
+/// Ctrl+V is handled by the app because it needs the system clipboard.
+pub fn is_paste(event: &KeyEvent, mods: ModifiersState) -> bool {
+    if !mods.control_key() {
+        return false;
+    }
+    matches!(&event.logical_key, Key::Character(c) if c.as_str().eq_ignore_ascii_case("v"))
 }
 
 /// Mouse wheel: one notch is three lines. Pixel deltas are converted by the
