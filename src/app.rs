@@ -39,6 +39,10 @@ use crate::workspace::{self, Workspace};
 // threads, which would clutter the event loop code here.
 #[cfg(feature = "updater")]
 mod update;
+// Language servers: the event loop's glue (documents, debounced changes,
+// diagnostics back onto the buffer). The model is in `lsp/`.
+#[cfg(feature = "lsp")]
+mod lsp;
 
 // The settings page always has an `UpdateInfo`; without the feature it is the
 // fixed default `Check now` row, which the page never renders anyway because
@@ -47,6 +51,46 @@ impl App {
     #[cfg(not(feature = "updater"))]
     fn update_info(&self) -> settings::UpdateInfo {
         settings::UpdateInfo::default()
+    }
+}
+
+/// The `lsp` feature is off: the chrome still asks for diagnostics and a
+/// tooltip, and both are simply always empty. Keeping the accessors here means
+/// the drawing code in `redraw` has no `cfg` of its own.
+#[cfg(not(feature = "lsp"))]
+#[allow(dead_code)] // empty stand-ins; see the comment above
+impl App {
+    fn diagnostics_snapshot(&self) -> crate::lsp::diagnostics::Diagnostics {
+        crate::lsp::diagnostics::Diagnostics::default()
+    }
+
+    fn diag_tooltip(&self) -> Option<view::DiagTooltip> {
+        None
+    }
+
+    fn init_lsp(&mut self) {}
+    fn sync_lsp_documents(&mut self) {}
+    fn take_lsp_message(&mut self) -> Option<String> {
+        None
+    }
+    fn step_diag_hover(&mut self, _now: std::time::Instant) {}
+    fn diag_hover_deadline(&self) -> Option<std::time::Instant> {
+        None
+    }
+    fn diag_char_under_pointer(&self) -> Option<usize> {
+        None
+    }
+    fn lsp_deadline(&self) -> Option<std::time::Instant> {
+        None
+    }
+    fn pump_lsp(&mut self, _now: std::time::Instant) {}
+    fn reconfigure_lsp(&mut self) {}
+    fn shutdown_lsp(&mut self) {}
+    fn sync_lsp_root(&mut self) {}
+    fn lsp_close(&mut self, _path: &std::path::Path) {}
+    fn lsp_saved(&mut self, _path: &std::path::Path, _text: &str) {}
+    fn lsp_status(&self) -> Option<String> {
+        None
     }
 }
 
@@ -80,6 +124,10 @@ pub enum UserEvent {
     /// The updater has news: a new release, progress, or a result.
     #[cfg(feature = "updater")]
     Update(crate::updater::UpdateEvent),
+    /// A language server sent a message. Deliberately the raw event: the
+    /// reader thread does no interpretation beyond framing.
+    #[cfg(feature = "lsp")]
+    Lsp(crate::lsp::client::LspEvent),
     #[cfg(feature = "syntax")]
     ParseDone {
         buffer: usize,
@@ -198,6 +246,15 @@ pub struct App {
     /// a redraw per 64 KB chunk.
     #[cfg(feature = "updater")]
     last_progress_at: std::time::Instant,
+    /// Language servers (v1.2 section 7). Built after the config is loaded;
+    /// `None` until then, and always `None` with the feature off.
+    #[cfg(feature = "lsp")]
+    lsp: Option<crate::lsp::Lsp>,
+    /// Diagnostic tooltip: the hovered diagnostic's character range and the
+    /// instant the pointer came to rest on it. `None` means no tooltip. The
+    /// deadline is what makes the loop `WaitUntil` for 300 ms and no more.
+    #[cfg(feature = "lsp")]
+    diag_hover: Option<lsp::DiagHover>,
 }
 
 impl App {
@@ -252,6 +309,10 @@ impl App {
             first_frame_at: None,
             #[cfg(feature = "updater")]
             last_progress_at: std::time::Instant::now(),
+            #[cfg(feature = "lsp")]
+            lsp: None,
+            #[cfg(feature = "lsp")]
+            diag_hover: None,
         }
     }
 
@@ -1063,6 +1124,8 @@ impl App {
         if let Some(ws) = self.workspace.as_mut() {
             ws.set_indent(self.config.tab_width);
         }
+        // The LSP toggle and the server commands live in the same config file.
+        self.reconfigure_lsp();
         self.sidebar_manual = match self.config.sidebar {
             SidebarMode::Auto => None,
             SidebarMode::Expanded => Some(true),
@@ -1386,9 +1449,18 @@ impl App {
         // This runs before the GL borrows below, because it takes `self`.
         #[cfg(feature = "syntax")]
         self.start_async_parse_if_needed();
+        // A file opened this frame is handed to its server before drawing, so
+        // a publish that arrives next frame has a document to land in.
+        self.sync_lsp_documents();
         // Both read `self`, so they must be built before the GL borrows below.
         #[cfg(feature = "updater")]
         let settings_update_info = self.update_info();
+        // Diagnostics are the only part of the chrome that comes from the
+        // server instead of the editor: a snapshot now, so the draw code holds
+        // a plain list while it has `&mut gl`.
+        let diagnostics = self.diagnostics_snapshot();
+        let tooltip = self.diag_tooltip();
+        let lsp_status = self.lsp_status();
         let (Some(window), Some(gl), Some(ws)) = (
             self.window.as_ref(),
             self.gl.as_mut(),
@@ -1488,6 +1560,8 @@ impl App {
             settings: self.settings_open,
             radius: self.config.corner_radius as f32,
             buttons_left: self.config.window_buttons == Buttons::Left,
+            diagnostics: &diagnostics,
+            tooltip: tooltip.as_ref(),
         };
         view::draw(r, ws, &layout, &chrome);
         // The settings page replaces the text area, over the editor layer.
@@ -1552,6 +1626,7 @@ impl App {
                 flags: &flags,
                 gl_version: &version_string,
                 gl_renderer: &renderer_string,
+                lsp: lsp_status.as_deref(),
             };
             r.layer(crate::render::Layer::Overlay);
             let x = (w - 330.0 - 12.0).max(layout.sidebar_w + 8.0);
@@ -1649,6 +1724,10 @@ impl ApplicationHandler<UserEvent> for App {
                 eprintln!("ludicrous: could not create window: {e}");
                 event_loop.exit();
             }
+            // Servers are built after the window exists (so the first frame is
+            // never delayed by a process spawn) and before any file is opened,
+            // so the first `sync_lsp_documents` has somewhere to put them.
+            self.init_lsp();
         }
     }
 
@@ -1663,6 +1742,17 @@ impl ApplicationHandler<UserEvent> for App {
             let paths = std::mem::take(&mut self.pending_drops);
             self.open_paths(&paths);
         }
+        // Send whatever debounced edits are due, show any pending server
+        // message, and let the tooltip appear once the pointer has rested.
+        // With the feature off every one of these is an empty function.
+        {
+            let now = std::time::Instant::now();
+            self.pump_lsp(now);
+            if let Some(message) = self.take_lsp_message() {
+                self.status_hint(&message);
+            }
+            self.step_diag_hover(now);
+        }
         // The update check may want a future wake-up (ten seconds after the
         // first frame). It never polls: it either does nothing or names the one
         // instant to wake at.
@@ -1670,6 +1760,21 @@ impl ApplicationHandler<UserEvent> for App {
         let wake_at = self.maybe_check_updates();
         #[cfg(not(feature = "updater"))]
         let wake_at: Option<std::time::Instant> = None;
+        // The LSP debounce (50 ms after the first pending edit) and any server
+        // restart land here too: one wake-up, the earliest of all the reasons.
+        let lsp_wake = self.lsp_deadline();
+        let mut wake_at = match (wake_at, lsp_wake) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        // The diagnostic tooltip's 300 ms delay is one more reason to wake, and
+        // it only exists while a pointer rests on a squiggle.
+        if let Some(at) = self.diag_hover_deadline() {
+            wake_at = Some(match wake_at {
+                Some(other) => other.min(at),
+                None => at,
+            });
+        }
         if !self.caret_visible_now() {
             // No caret on screen: no blink timer at all. This is what keeps the
             // loop at `Wait` (0.0% CPU) on the settings page, with the tree
@@ -1705,6 +1810,8 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::DialogResult(kind, paths) => self.dialog_result(kind, paths),
             #[cfg(feature = "updater")]
             UserEvent::Update(ev) => self.update_event(ev),
+            #[cfg(feature = "lsp")]
+            UserEvent::Lsp(ev) => self.lsp_event(ev),
             #[cfg(feature = "syntax")]
             UserEvent::ParseDone {
                 buffer,
@@ -1717,6 +1824,8 @@ impl ApplicationHandler<UserEvent> for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
+                // Same guard as Ctrl+Q: unsaved text asks first. The servers
+                // are stopped only when the loop really exits.
                 // The close button goes through the same guard as Ctrl+Q, and
                 // every open buffer must be clean before we exit.
                 let quit = match self.workspace.as_mut() {
@@ -1857,6 +1966,16 @@ impl ApplicationHandler<UserEvent> for App {
                         return;
                     }
                     if is_w {
+                        // The server must forget a document before its buffer
+                        // goes away, or a publish for it would land nowhere.
+                        let closed = self
+                            .workspace
+                            .as_ref()
+                            .and_then(|ws| ws.active_editor())
+                            .and_then(|ed| ed.path().map(|p| p.to_path_buf()));
+                        if let Some(path) = closed {
+                            self.lsp_close(&path);
+                        }
                         if let Some(ws) = self.workspace.as_mut() {
                             // close_active only returns Quit for the guard on a
                             // dirty buffer; closing never exits the window.
@@ -1888,6 +2007,7 @@ impl ApplicationHandler<UserEvent> for App {
                     };
                     if quit {
                         self.remember_state();
+                        self.shutdown_lsp();
                         event_loop.exit();
                     } else if let Some(w) = self.window.as_ref() {
                         w.request_redraw();
@@ -1898,13 +2018,31 @@ impl ApplicationHandler<UserEvent> for App {
                 if matches!(cmd, Command::Copy | Command::Cut) {
                     self.copy_selection();
                 }
+                let saving = cmd == Command::Save;
                 let Some(ed) = self.workspace.as_mut().and_then(|w| w.active_editor_mut()) else {
                     return;
                 };
                 if ed.apply(cmd) == Control::Quit {
                     self.remember_state();
+                    self.shutdown_lsp();
                     event_loop.exit();
                     return;
+                }
+                // A save may unblock a server's own check (clangd re-reads the
+                // file on `didSave`), so the text goes out now, not on the
+                // next debounce.
+                if saving {
+                    let saved = self
+                        .workspace
+                        .as_ref()
+                        .and_then(|ws| ws.active_editor())
+                        .and_then(|ed| {
+                            let path = ed.path()?.to_path_buf();
+                            Some((path, ed.buffer.rope.to_string()))
+                        });
+                    if let Some((path, text)) = saved {
+                        self.lsp_saved(&path, &text);
+                    }
                 }
                 if let Some(w) = self.window.as_ref() {
                     w.request_redraw();
