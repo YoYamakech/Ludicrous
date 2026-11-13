@@ -1490,13 +1490,21 @@ impl App {
         );
         let (rows, cols) = (layout.rows, layout.cols);
         if let Some(ed) = ws.active_editor_mut() {
-            ed.ensure_visible(rows, cols);
-            ed.ensure_highlighter();
+            // Scrolling the caret into view only matters for a drawn text
+            // area; the highlighter is built on first draw, not on start-up.
+            if !self.settings_open {
+                ed.ensure_visible(rows, cols);
+                ed.ensure_highlighter();
+            }
         }
         // Highlight only the visible lines. The highlighter caches by version
         // and range, so a blink or a hover redraw reuses these spans.
+        //
+        // While the settings page covers the text area the editor is not drawn
+        // at all, so its spans would be computed and then thrown away: skip
+        // the parse entirely (issue #5.2).
         let span_first = ws.active_editor().map(|e| e.scroll).unwrap_or(0);
-        let spans = match ws.active_editor_mut() {
+        let spans = match ws.active_editor_mut().filter(|_| !self.settings_open) {
             Some(ed) => {
                 let last = span_first + rows + 2;
                 let version = ed.buffer.version;
@@ -1562,6 +1570,10 @@ impl App {
             buttons_left: self.config.window_buttons == Buttons::Left,
             diagnostics: &diagnostics,
             tooltip: tooltip.as_ref(),
+            tab_width: self.config.tab_width,
+            // Guides are a reading aid for code; they live inside the editor
+            // layer, so the settings page never shows them.
+            indent_guides: true,
         };
         view::draw(r, ws, &layout, &chrome);
         // The settings page replaces the text area, over the editor layer.

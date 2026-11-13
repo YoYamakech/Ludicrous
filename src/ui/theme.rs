@@ -65,6 +65,11 @@ pub struct Palette {
     /// Tooltip surface and its hairline, above the text area.
     pub tooltip_bg: Color,
     pub tooltip_border: Color,
+    /// Vertical indent guides in the text area. Very close to the background:
+    /// they should be findable when looked at and invisible when read.
+    pub indent_guide: Color,
+    /// The guide for the level the caret sits in. Same hue, stronger.
+    pub indent_guide_active: Color,
 }
 
 pub const DARK: Palette = Palette {
@@ -90,6 +95,8 @@ pub const DARK: Palette = Palette {
     diag_info: rgb(0x6aa8e8),
     tooltip_bg: rgb(0x23262e),
     tooltip_border: rgb(0x3a4150),
+    indent_guide: rgb(0x2c3139),
+    indent_guide_active: rgb(0x454d59),
     // Dark syntax colours: soft on the eyes, distinct at 8 px tall glyphs.
     syn_keyword: rgb(0xc792ea),
     syn_string: rgb(0x9ece6a),
@@ -130,6 +137,8 @@ pub const LIGHT: Palette = Palette {
     diag_info: rgb(0x2166b0),
     tooltip_bg: rgb(0xffffff),
     tooltip_border: rgb(0xc8cdd6),
+    indent_guide: rgb(0xd8dce3),
+    indent_guide_active: rgb(0xb2b9c4),
     // Light syntax colours: darker versions of the same hues.
     syn_keyword: rgb(0x8a3fb0),
     syn_string: rgb(0x3e7d1f),

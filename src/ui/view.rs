@@ -61,6 +61,11 @@ pub struct Chrome<'a> {
     pub diagnostics: &'a crate::lsp::diagnostics::Diagnostics,
     /// The tooltip to draw now, if the pointer has rested on a diagnostic.
     pub tooltip: Option<&'a DiagTooltip>,
+    /// Spaces per indent level, for the indent guides (v1.2 section 6).
+    pub tab_width: usize,
+    /// Draw the indent guides at all. Off while the settings page is open
+    /// (there is no text) or when they would only add noise.
+    pub indent_guides: bool,
 }
 
 /// A diagnostic hover message that has earned its 300 ms and is on screen.
@@ -313,6 +318,37 @@ fn draw_editor(r: &mut Renderer, ed: &Editor, l: &Layout, p: &Palette, chrome: &
                 let x1 = r.text_pen_x(l.text_x, &line, to);
                 let sx = x0 - (r.text_pen_x(l.text_x, &line, ed.scroll_x) - l.text_x);
                 r.rect(sx, y, x1 - x0, l.cell_h, p.selection);
+            }
+        }
+        // Indent guides (section 6): 1 px lines at each tab stop inside the
+        // leading whitespace. Queued before the text so they sit behind the
+        // glyphs, and as hairlines they stay in the background batch, so a
+        // screen full of them adds no draw call.
+        if chrome.indent_guides {
+            let guides = crate::ui::indent::guides(&line, chrome.tab_width);
+            if !guides.is_empty() {
+                // How far the line has scrolled left, in points. `text_pen_x`
+                // already knows about tab widths, so the guides land on the
+                // text's own boundaries rather than on a guessed cell count.
+                let scroll_px = r.text_pen_x(l.text_x, &line, ed.scroll_x) - l.text_x;
+                let here = (idx == ed.cursor.line).then(|| {
+                    crate::ui::indent::active_level(&guides, &line, ed.cursor.col, chrome.tab_width)
+                });
+                for g in guides {
+                    if g.col < ed.scroll_x {
+                        continue;
+                    }
+                    // Absolute window x, minus the scroll: this is a *point*
+                    // coordinate like every other `r.rect` argument.
+                    let x = (r.text_pen_x(l.text_x, &line, g.col) - scroll_px).round();
+                    let active = here.flatten() == Some(g.level);
+                    let color = if active {
+                        p.indent_guide_active
+                    } else {
+                        p.indent_guide
+                    };
+                    r.rect(x, y + 1.0, 1.0, l.cell_h - 2.0, color);
+                }
             }
         }
         // Only the visible columns are laid out: a 100,000-character line
