@@ -209,14 +209,16 @@ fn draw_status_bar(r: &mut Renderer, ed: &Editor, l: &Layout) {
             .unwrap_or("[No Name]"),
         None => "[No Name]",
     };
-    r.text_ui(GUTTER_PAD, text_y, name, theme::STATUS_TEXT);
+    // Text is offset by the bar's own left edge: with a sidebar open the bar
+    // starts at `sx`, and drawing at x = 8 would overlap the project card.
+    let tx = sx + GUTTER_PAD;
+    r.text_ui(tx, text_y, name, theme::STATUS_TEXT);
+    let mx = tx + r.ui_text_width(name) + 8.0;
     if let Some(msg) = &ed.status {
         // A failed save is more urgent than the modified marker, so it takes
         // that spot in the bar.
-        let mx = GUTTER_PAD + r.ui_text_width(name) + 8.0;
         r.text_ui(mx, text_y, msg, theme::ERROR);
     } else if ed.is_dirty() {
-        let mx = GUTTER_PAD + r.ui_text_width(name) + 8.0;
         r.text_ui(mx, text_y, "[modified]", theme::MODIFIED);
     }
 

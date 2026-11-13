@@ -519,7 +519,10 @@ fn queue_text(
         // Unknown characters (anything outside ASCII) draw as `?` rather than
         // vanishing, and never panic.
         let g = atlas.get(ch).or_else(|| atlas.fallback());
-        if let Some(g) = g {
+        // Blank glyphs (space, tab stops above) have no bitmap: advance only.
+        // Emitting a quad for them would be a zero-size instance at best, and
+        // treating them as unknown is what caused issue #2.
+        if let Some(g) = g.filter(|g| atlas.has_bitmap(g)) {
             let gx = (pen + g.xoff).round();
             let gy = (baseline - g.yoff).round();
             batch.push(&[
