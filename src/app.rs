@@ -1491,8 +1491,10 @@ impl App {
                 &self.config,
                 update_info,
                 self.settings_row,
-                self.settings_hover_seg,
-                self.settings_hover,
+                settings::Pointer {
+                    row: self.settings_hover,
+                    segment: self.settings_hover_seg,
+                },
             );
         }
 

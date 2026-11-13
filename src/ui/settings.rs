@@ -146,7 +146,27 @@ impl Geometry {
     }
 }
 
+/// What the pointer is doing, as far as the page cares. Grouped so `draw`
+/// keeps a readable argument list.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Pointer {
+    /// Row under the pointer, if any.
+    pub row: Option<usize>,
+    /// Option of that row's choice control under the pointer, if any. Comes
+    /// from the hit map, so it is the piece a click would hit.
+    pub segment: Option<usize>,
+}
+
+impl Pointer {
+    /// Is this row hovered but not keyboard-selected? The selected row shows a
+    /// stronger focus pill, so it never draws the hover wash too.
+    fn hovers(self, row: usize, selected: usize) -> bool {
+        self.row == Some(row) && row != selected
+    }
+}
+
 /// Draw the page. Returns the row geometry for hit testing (same maths).
+#[allow(clippy::too_many_arguments)] // renderer, layout, theme, config, state
 pub fn draw(
     r: &mut Renderer,
     l: &Layout,
@@ -154,9 +174,7 @@ pub fn draw(
     cfg: &Config,
     update: &UpdateInfo,
     selected: usize,
-    hover: Option<usize>,
-    // Which option of the hovered row's choice control is under the pointer.
-    hover_seg: Option<usize>,
+    pointer: Pointer,
 ) -> Geometry {
     let geo = Geometry::new(l);
 
@@ -173,8 +191,8 @@ pub fn draw(
         let y = geo.row_y(i);
         let focused = i == selected;
         // Which segment is under the pointer, for the per-segment hover wash.
-        let hovered = hover == Some(i) && !focused;
-        let seg = if hovered { hover_seg } else { None };
+        let hovered = pointer.hovers(i, selected);
+        let seg = if hovered { pointer.segment } else { None };
         let widget = widget_for(*row, cfg, update, seg);
         let label = match *row {
             // The updater row explains itself: what is available, or what
