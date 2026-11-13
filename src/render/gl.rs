@@ -230,6 +230,28 @@ impl Batch {
         }
     }
 
+    /// Bounding box `[x, y, w, h]` of every instance in the batch.
+    ///
+    /// Both instance layouts start with the quad rect in the first four
+    /// floats, and the rest of the stride differs, so the box is read here
+    /// rather than kept in a parallel field. Used to decide whether queuing a
+    /// shape would really hide any queued text (issue #4).
+    pub fn bounds(&self) -> Option<[f32; 4]> {
+        if self.data.is_empty() {
+            return None;
+        }
+        let (mut x0, mut y0) = (f32::MAX, f32::MAX);
+        let (mut x1, mut y1) = (f32::MIN, f32::MIN);
+        for inst in self.data.chunks(self.stride_floats) {
+            let (x, y, w, h) = (inst[0], inst[1], inst[2], inst[3]);
+            x0 = x0.min(x);
+            y0 = y0.min(y);
+            x1 = x1.max(x + w);
+            y1 = y1.max(y + h);
+        }
+        Some([x0, y0, x1 - x0, y1 - y0])
+    }
+
     pub fn len(&self) -> usize {
         self.data.len() / self.stride_floats
     }

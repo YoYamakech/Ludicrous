@@ -88,6 +88,10 @@ pub struct Renderer {
     tab_columns: usize,
     // Clip stack in physical pixels; each entry is [x, y, w, h].
     clip: Vec<[f32; 4]>,
+    /// Bounds of every glyph queued *after* the last shape, in physical
+    /// pixels. A shape that does not intersect this box cannot hide any of
+    /// them, so the batches need not be split (issue #4).
+    pending_glyph_bounds: Option<[f32; 4]>,
     layer: Layer,
     // Window shape mask uniforms, in physical pixels.
     window_w: f32,
@@ -178,6 +182,7 @@ impl Renderer {
             ui_px,
             tab_columns: TAB_COLUMNS,
             clip: Vec::new(),
+            pending_glyph_bounds: None,
             layer: Layer::Background,
             window_w: 1.0,
             window_h: 1.0,
@@ -318,6 +323,7 @@ impl Renderer {
         self.glyphs.data.clear();
         self.ui_glyphs.data.clear();
         self.icon_glyphs.data.clear();
+        self.pending_glyph_bounds = None;
     }
 
     /// Set the rounded window mask, in points. Every fragment outside this
@@ -414,17 +420,30 @@ impl Renderer {
         self.icon_char(x, y, glyph, size, color);
     }
 
+    /// Would a shape at this box really cover queued text?
+    ///
+    /// A shape must paint over text that was queued before it, and the two
+    /// batches are drawn rects-then-text on every flush. So a flush is only
+    /// needed when the new shape actually intersects the queued glyphs.
+    /// Without this test every label border or row hairline split the batch,
+    /// which is where the 21+ flushes per frame came from (issue #4).
+    fn covers_pending_text(&self, x: f32, y: f32, w: f32, h: f32) -> bool {
+        let s = self.scale;
+        let box_ = [x * s, y * s, w * s, h * s];
+        [&self.glyphs, &self.ui_glyphs, &self.icon_glyphs]
+            .iter()
+            .filter_map(|b| b.bounds())
+            .any(|b| intersects(b, box_))
+    }
+
     fn icon_char(&mut self, x: f32, y: f32, glyph: char, size: f32, color: Color) {
         let Some(g) = self.icon_atlas.get_char(glyph).copied() else {
             // A missing glyph draws nothing rather than a wrong box: a file icon
             // is decoration, not content (v1.2 section 4).
             return;
         };
-        // A shape queued after text must paint over it; same rule as shape().
-        if !self.glyphs.data.is_empty()
-            || !self.ui_glyphs.data.is_empty()
-            || !self.icon_glyphs.data.is_empty()
-        {
+        // Painted over any text it covers; same rule as `shape()`.
+        if self.covers_pending_text(x, y, size, size) {
             self.flush_batches();
         }
         let s = self.scale;
@@ -458,13 +477,10 @@ impl Renderer {
         if w <= 0.0 || h <= 0.0 || color[3] <= 0.0 {
             return;
         }
-        // A shape queued after text must paint over it. Flush *both* batches:
-        // rects are only uploaded at flush time, so flushing the glyphs alone
-        // would let an earlier background rect land on top of the text.
-        if !self.glyphs.data.is_empty()
-            || !self.ui_glyphs.data.is_empty()
-            || !self.icon_glyphs.data.is_empty()
-        {
+        // A shape queued after text must paint over it. That only needs a
+        // flush — and a second draw call — when the two really overlap; a
+        // panel background behind a label does not.
+        if self.covers_pending_text(x, y, w, h) {
             self.flush_batches();
         }
         let s = self.scale;
@@ -664,6 +680,11 @@ fn intersect(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Do two `[x, y, w, h]` boxes share any pixels?
+fn intersects(a: [f32; 4], b: [f32; 4]) -> bool {
+    a[0] < b[0] + b[2] && b[0] < a[0] + a[2] && a[1] < b[1] + b[3] && b[1] < a[1] + a[3]
+}
+
 fn queue_text(
     atlas: &Atlas,
     batch: &mut Batch,
