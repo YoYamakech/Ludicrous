@@ -685,6 +685,9 @@ fn intersects(a: [f32; 4], b: [f32; 4]) -> bool {
     a[0] < b[0] + b[2] && b[0] < a[0] + a[2] && a[1] < b[1] + b[3] && b[1] < a[1] + a[3]
 }
 
+// Nine inputs, each a distinct drawing parameter; a struct here would be
+// noise at every call site.
+#[allow(clippy::too_many_arguments)]
 fn queue_text(
     atlas: &Atlas,
     batch: &mut Batch,
