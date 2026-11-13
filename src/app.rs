@@ -12,7 +12,7 @@ use glutin::surface::{GlSurface, Surface, SurfaceAttributesBuilder, SwapInterval
 use glutin_winit::DisplayBuilder;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::keyboard::ModifiersState;
 use winit::raw_window_handle::HasWindowHandle;
@@ -44,6 +44,8 @@ pub struct App {
     /// Created on first use: opening the X11/Wayland clipboard at startup
     /// would slow cold start and can fail on a headless machine.
     clipboard: Option<arboard::Clipboard>,
+    /// Last mouse position in physical pixels, for click-to-place-cursor.
+    cursor_pos: Option<winit::dpi::PhysicalPosition<f64>>,
 }
 
 impl App {
@@ -55,6 +57,7 @@ impl App {
             editor: None,
             mods: ModifiersState::empty(),
             clipboard: None,
+            cursor_pos: None,
         }
     }
 
@@ -200,6 +203,18 @@ impl App {
         Ok(())
     }
 
+    /// Build the current layout from the window size. Used by both drawing and
+    /// hit testing, so a click always lands where the text was drawn.
+    fn layout(&self) -> Option<Layout> {
+        let window = self.window.as_ref()?;
+        let gl = self.gl.as_ref()?;
+        let ed = self.editor.as_ref()?;
+        let size = window.inner_size();
+        let scale = window.scale_factor() as f32;
+        let (w, h) = (size.width as f32 / scale, size.height as f32 / scale);
+        Some(Layout::new(&gl.renderer, ed.buffer.line_count(), w, h))
+    }
+
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
         let (Some(window), Some(gl), Some(ed)) =
             (self.window.as_ref(), self.gl.as_mut(), self.editor.as_mut())
@@ -280,6 +295,36 @@ impl ApplicationHandler for App {
                 if let Some(w) = self.window.as_ref() {
                     w.request_redraw();
                 }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                if state != ElementState::Pressed || button != MouseButton::Left {
+                    return;
+                }
+                let Some(pos) = self.cursor_pos else {
+                    return;
+                };
+                let Some(layout) = self.layout() else {
+                    return;
+                };
+                let Some(ed) = self.editor.as_mut() else {
+                    return;
+                };
+                let scale = self
+                    .window
+                    .as_ref()
+                    .map(|w| w.scale_factor() as f32)
+                    .unwrap_or(1.0);
+                let (x, y) = (pos.x as f32 / scale, pos.y as f32 / scale);
+                // Clicks outside the text area (gutter, status bar) do nothing.
+                if let Some((line, col)) = layout.text_position(x, y, ed.scroll, ed.scroll_x) {
+                    ed.apply(Command::Click { line, col });
+                    if let Some(w) = self.window.as_ref() {
+                        w.request_redraw();
+                    }
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor_pos = Some(position);
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 // Convert pixel deltas to lines using the current cell height.

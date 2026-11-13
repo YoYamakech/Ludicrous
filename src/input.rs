@@ -49,7 +49,8 @@ pub fn key(event: &KeyEvent, mods: ModifiersState) -> Option<Command> {
         Key::Named(NamedKey::End) => Some(Command::End),
         Key::Named(NamedKey::PageUp) => Some(Command::PageUp),
         Key::Named(NamedKey::PageDown) => Some(Command::PageDown),
-        Key::Named(NamedKey::Tab) => Some(Command::Insert('\t')),
+        Key::Named(NamedKey::Tab) if shift => Some(Command::Unindent),
+        Key::Named(NamedKey::Tab) => Some(Command::Tab),
         Key::Named(NamedKey::Space) => Some(Command::Insert(' ')),
         // Text input (layout-aware, handles shift and dead keys for us).
         Key::Character(s) => {

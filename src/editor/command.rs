@@ -25,6 +25,15 @@ pub enum Command {
     Cut,
     /// Paste text from the system clipboard (the app reads it, not the editor).
     Paste(String),
+    /// Move the cursor to a click position, in buffer coordinates.
+    Click {
+        line: usize,
+        col: usize,
+    },
+    /// Insert spaces up to the next indent stop.
+    Tab,
+    /// Remove up to one indent level from the start of the line.
+    Unindent,
     PageUp,
     PageDown,
     /// Scroll by a number of lines (positive = down).

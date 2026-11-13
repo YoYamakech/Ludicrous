@@ -52,4 +52,27 @@ impl Layout {
             cols,
         }
     }
+
+    /// Map a point in the window to a buffer position, or `None` when the
+    /// point is outside the text area (gutter, status bar, padding).
+    ///
+    /// `scroll`/`scroll_x` are the editor's current scroll offsets, so the
+    /// result is in buffer coordinates, not screen ones.
+    pub fn text_position(
+        &self,
+        x: f32,
+        y: f32,
+        scroll: usize,
+        scroll_x: usize,
+    ) -> Option<(usize, usize)> {
+        if x < self.text_x || x >= self.text_x + self.text_w {
+            return None;
+        }
+        if y < self.text_y || y >= self.height - self.status_h {
+            return None;
+        }
+        let row = ((y - self.text_y) / self.cell_h).floor().max(0.0) as usize;
+        let col = ((x - self.text_x) / self.cell_w).floor().max(0.0) as usize;
+        Some((scroll + row, scroll_x + col))
+    }
 }

@@ -14,6 +14,9 @@ use crate::editor::history::{Edit, EditKind, History};
 /// again.
 const QUIT_ARM_WINDOW: Duration = Duration::from_secs(3);
 
+/// One indent level, in spaces. Change this one number to change the style.
+pub const INDENT_WIDTH: usize = 4;
+
 /// What the app should do after a command has been applied.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Control {
@@ -169,6 +172,57 @@ impl Editor {
         Control::Continue
     }
 
+    /// Indent every line the selection touches by one level, as one undo step.
+    fn indent_selection(&mut self) {
+        let Some((start, end)) = self.selection() else {
+            return;
+        };
+        let (first, _) = self.buffer.line_col_of(start);
+        let (last, _) = self.buffer.line_col_of(end);
+        let before = self.cursor;
+        let mut edits = Vec::new();
+        // Apply top-down and record in that order. Undo replays the list
+        // backwards, so it removes the last (lowest) line first, and every
+        // recorded position is still valid at the moment it is used.
+        for line in first..=last {
+            let pos = self.buffer.char_index(line, 0);
+            let text = " ".repeat(INDENT_WIDTH);
+            self.buffer.insert_str_at(pos, &text);
+            edits.push(Edit::Insert { pos, text });
+        }
+        // Keep the selection covering the same text.
+        self.cursor.col += INDENT_WIDTH;
+        if let Some(a) = self.anchor.as_mut() {
+            a.col += INDENT_WIDTH;
+        }
+        self.history.record_entry(edits, before, self.cursor);
+        self.sync_modified();
+    }
+
+    /// Remove up to one indent level of spaces from the start of the cursor's
+    /// line (Shift+Tab).
+    fn unindent_line(&mut self) {
+        let line = self.cursor.line;
+        let text = self.buffer.line(line);
+        let spaces = text.chars().take_while(|c| *c == ' ').count();
+        let remove = spaces.min(INDENT_WIDTH);
+        if remove == 0 {
+            return;
+        }
+        let before = self.cursor;
+        let pos = self.buffer.char_index(line, 0);
+        let removed: String = text.chars().take(remove).collect();
+        self.buffer.remove_at(pos, remove);
+        self.cursor.col = self.cursor.col.saturating_sub(remove);
+        self.cursor.desired_col = self.cursor.col;
+        self.history.record_entry(
+            vec![Edit::Delete { pos, text: removed }],
+            before,
+            self.cursor,
+        );
+        self.sync_modified();
+    }
+
     /// Start a cursor movement. `extend` keeps (or starts) a selection.
     fn begin_move(&mut self, extend: bool) {
         self.history.break_group();
@@ -262,24 +316,47 @@ impl Editor {
                     self.insert_text("\n");
                     return Control::Continue;
                 }
+                // Auto-indent: copy the current line's leading whitespace, and
+                // add one level if the line ends with `{`.
+                let line = self.buffer.line(self.cursor.line);
+                let indent: String = line
+                    .chars()
+                    .take_while(|c| *c == ' ' || *c == '\t')
+                    .collect();
+                let extra = if line.trim_end().ends_with('{') {
+                    " ".repeat(INDENT_WIDTH)
+                } else {
+                    String::new()
+                };
+                let text = format!("\n{indent}{extra}");
                 let before = self.cursor;
                 let pos = self.buffer.char_index(self.cursor.line, self.cursor.col);
-                let (l, c) = self
-                    .buffer
-                    .insert_newline(self.cursor.line, self.cursor.col);
+                self.buffer.insert_str_at(pos, &text);
+                let end = pos + text.chars().count();
+                let (l, c) = self.buffer.line_col_of(end);
                 self.cursor.line = l;
                 self.cursor.col = c;
                 self.cursor.desired_col = c;
                 self.history.record(
-                    Edit::Insert {
-                        pos,
-                        text: "\n".to_string(),
-                    },
+                    Edit::Insert { pos, text },
                     EditKind::Newline,
                     before,
                     self.cursor,
                     Instant::now(),
                 );
+            }
+            Command::Tab => {
+                if self.selection().is_some() {
+                    // With a selection, Tab indents every line it touches.
+                    self.indent_selection();
+                    return Control::Continue;
+                }
+                let col = self.cursor.col;
+                let spaces = INDENT_WIDTH - (col % INDENT_WIDTH);
+                self.insert_text(&" ".repeat(spaces));
+            }
+            Command::Unindent => {
+                self.unindent_line();
             }
             Command::Backspace => {
                 if self.selection().is_some() {
@@ -440,6 +517,14 @@ impl Editor {
                     return Control::Continue;
                 }
                 self.insert_text(&text);
+            }
+            Command::Click { line, col } => {
+                self.history.break_group();
+                self.anchor = None;
+                let line = line.min(self.buffer.line_count().saturating_sub(1));
+                self.cursor.line = line;
+                self.cursor.col = col.min(self.buffer.line_len(line));
+                self.cursor.desired_col = self.cursor.col;
             }
             Command::Scroll(lines) => {
                 // Fractional values accumulate in `scroll` as whole lines only;
@@ -776,6 +861,67 @@ mod tests {
         ed.apply(Command::Backspace);
         assert_eq!(ed.buffer.line(0), "cdef");
         assert_eq!((ed.cursor.line, ed.cursor.col), (0, 0));
+    }
+
+    #[test]
+    fn enter_keeps_the_indent() {
+        let mut ed = editor("    foo");
+        ed.apply(Command::End);
+        ed.apply(Command::Newline);
+        assert_eq!(ed.buffer.line(1), "    ");
+        assert_eq!((ed.cursor.line, ed.cursor.col), (1, 4));
+    }
+
+    #[test]
+    fn enter_after_a_brace_adds_one_level() {
+        let mut ed = editor("    if (x) {");
+        ed.apply(Command::End);
+        ed.apply(Command::Newline);
+        assert_eq!(ed.buffer.line(1), "        ");
+    }
+
+    #[test]
+    fn tab_inserts_spaces_to_the_next_stop() {
+        let mut ed = editor("");
+        ed.apply(Command::Tab);
+        assert_eq!(ed.buffer.line(0), "    ");
+        ed.apply(Command::Insert('a'));
+        ed.apply(Command::Tab);
+        assert_eq!(ed.buffer.line(0), "    a   ");
+    }
+
+    #[test]
+    fn shift_tab_removes_one_level() {
+        let mut ed = editor("        x");
+        ed.apply(Command::End);
+        ed.apply(Command::Unindent);
+        assert_eq!(ed.buffer.line(0), "    x");
+        assert_eq!(ed.cursor.col, 5);
+        ed.apply(Command::Unindent);
+        assert_eq!(ed.buffer.line(0), "x");
+        ed.apply(Command::Unindent); // nothing left to remove
+        assert_eq!(ed.buffer.line(0), "x");
+    }
+
+    #[test]
+    fn tab_with_a_selection_indents_every_line() {
+        let mut ed = editor("a\nb");
+        ed.apply(Command::SelectAll);
+        ed.apply(Command::Tab);
+        assert_eq!(ed.buffer.line(0), "    a");
+        assert_eq!(ed.buffer.line(1), "    b");
+        ed.apply(Command::Undo);
+        assert_eq!(ed.buffer.line(0), "a");
+        assert_eq!(ed.buffer.line(1), "b");
+    }
+
+    #[test]
+    fn click_clamps_to_the_line_length() {
+        let mut ed = editor("ab\nlonger line");
+        ed.apply(Command::Click { line: 0, col: 40 });
+        assert_eq!((ed.cursor.line, ed.cursor.col), (0, 2));
+        ed.apply(Command::Click { line: 99, col: 3 });
+        assert_eq!((ed.cursor.line, ed.cursor.col), (1, 3));
     }
 
     #[test]

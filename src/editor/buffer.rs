@@ -135,6 +135,9 @@ impl Buffer {
     }
 
     /// Split the line at the cursor. Returns the new cursor position.
+    /// (The editor now inserts the newline plus auto-indent in one step, so
+    /// this is only used by the buffer tests.)
+    #[allow(dead_code)]
     pub fn insert_newline(&mut self, line: usize, col: usize) -> (usize, usize) {
         let i = self.index(line, col);
         self.rope.insert_char(i, '\n');
