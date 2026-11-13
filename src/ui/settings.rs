@@ -34,6 +34,12 @@ pub enum Row {
     CornerRadius,
     Sidebar,
     Theme,
+    /// Language servers on/off (v1.2 section 7). Only in a build with `lsp`.
+    #[cfg(feature = "lsp")]
+    LanguageServers,
+    /// Syntax colours on/off (v1.2 section 6). Only with `syntax`.
+    #[cfg(feature = "syntax")]
+    SyntaxHighlighting,
     Animations,
     #[cfg(feature = "updater")]
     CheckUpdates,
@@ -42,11 +48,15 @@ pub enum Row {
 }
 
 impl Row {
-    #[cfg(feature = "updater")]
-    pub const COUNT: usize = 11;
-    #[cfg(not(feature = "updater"))]
-    pub const COUNT: usize = 9;
-    #[cfg(feature = "updater")]
+    /// How many rows this build has. The feature switches are folded into the
+    /// number instead of duplicating `ALL` four times: `cfg!` is a `const`, and
+    /// array elements can carry their own `#[cfg]`, so one list serves every
+    /// combination of features.
+    pub const COUNT: usize = 9
+        + cfg!(feature = "lsp") as usize
+        + cfg!(feature = "syntax") as usize
+        + 2 * cfg!(feature = "updater") as usize;
+
     pub const ALL: [Row; Row::COUNT] = [
         Row::FontSize,
         Row::TabWidth,
@@ -56,21 +66,15 @@ impl Row {
         Row::CornerRadius,
         Row::Sidebar,
         Row::Theme,
+        #[cfg(feature = "lsp")]
+        Row::LanguageServers,
+        #[cfg(feature = "syntax")]
+        Row::SyntaxHighlighting,
         Row::Animations,
+        #[cfg(feature = "updater")]
         Row::CheckUpdates,
+        #[cfg(feature = "updater")]
         Row::UpdateAction,
-    ];
-    #[cfg(not(feature = "updater"))]
-    pub const ALL: [Row; Row::COUNT] = [
-        Row::FontSize,
-        Row::TabWidth,
-        Row::LineNumbers,
-        Row::CursorBlink,
-        Row::WindowButtons,
-        Row::CornerRadius,
-        Row::Sidebar,
-        Row::Theme,
-        Row::Animations,
     ];
 
     pub fn from_index(i: usize) -> Row {
@@ -87,6 +91,10 @@ impl Row {
             Row::CornerRadius => "Corner radius",
             Row::Sidebar => "Sidebar",
             Row::Theme => "Theme",
+            #[cfg(feature = "lsp")]
+            Row::LanguageServers => "Language servers",
+            #[cfg(feature = "syntax")]
+            Row::SyntaxHighlighting => "Syntax highlighting",
             Row::Animations => "Animations",
             #[cfg(feature = "updater")]
             Row::CheckUpdates => "Check for updates",
@@ -358,6 +366,10 @@ pub fn widget_for<'a>(
             },
             hover,
         },
+        #[cfg(feature = "lsp")]
+        Row::LanguageServers => Widget::Toggle(cfg.lsp),
+        #[cfg(feature = "syntax")]
+        Row::SyntaxHighlighting => Widget::Toggle(cfg.syntax),
         Row::Animations => Widget::Toggle(cfg.animations),
         #[cfg(feature = "updater")]
         Row::CheckUpdates => Widget::Toggle(cfg.check_updates),
@@ -434,6 +446,10 @@ pub fn step(cfg: &mut Config, row: Row, delta: i32) -> bool {
                 Theme::Light => Theme::Dark,
             }
         }
+        #[cfg(feature = "lsp")]
+        Row::LanguageServers => cfg.lsp = !cfg.lsp,
+        #[cfg(feature = "syntax")]
+        Row::SyntaxHighlighting => cfg.syntax = !cfg.syntax,
         Row::Animations => cfg.animations = !cfg.animations,
         #[cfg(feature = "updater")]
         Row::CheckUpdates => cfg.check_updates = !cfg.check_updates,
@@ -486,6 +502,10 @@ pub fn choose(cfg: &mut Config, row: Row, index: usize) -> bool {
         Row::LineNumbers | Row::CursorBlink | Row::Animations | Row::FontSize => {
             return step(cfg, row, if index == 0 { -1 } else { 1 })
         }
+        #[cfg(feature = "lsp")]
+        Row::LanguageServers => return step(cfg, row, if index == 0 { -1 } else { 1 }),
+        #[cfg(feature = "syntax")]
+        Row::SyntaxHighlighting => return step(cfg, row, if index == 0 { -1 } else { 1 }),
     }
     *cfg != before
 }

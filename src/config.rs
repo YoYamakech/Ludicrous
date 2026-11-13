@@ -61,6 +61,19 @@ pub struct Config {
     /// check is once a day, ten seconds after the first frame, and silent when
     /// offline. Turning it off means no request is ever made.
     pub check_updates: bool,
+    /// Language servers (v1.2 section 7). On by default; no process starts
+    /// until a file of a supported language is opened.
+    pub lsp: bool,
+    /// Syntax colours (v1.2 section 6). On by default and lazy: a file is
+    /// parsed only once it is on screen.
+    pub syntax: bool,
+    /// The command for each language. Config-file only (not on the settings
+    /// page): every field is `None` until a `lsp_<lang> = ...` line appears,
+    /// which is what lets a new default reach an existing config file.
+    pub lsp_rust: Option<String>,
+    pub lsp_c: Option<String>,
+    pub lsp_cpp: Option<String>,
+    pub lsp_python: Option<String>,
 }
 
 impl Default for Config {
@@ -77,6 +90,12 @@ impl Default for Config {
             experimental_damage: false,
             animations: true,
             check_updates: true,
+            lsp: true,
+            syntax: true,
+            lsp_rust: None,
+            lsp_c: None,
+            lsp_cpp: None,
+            lsp_python: None,
         }
     }
 }
@@ -197,7 +216,37 @@ impl Config {
                     self.check_updates = v;
                 }
             }
+            "lsp" => {
+                if let Some(v) = parse_bool(value) {
+                    self.lsp = v;
+                }
+            }
+            "syntax" => {
+                if let Some(v) = parse_bool(value) {
+                    self.syntax = v;
+                }
+            }
+            // A command is free text: an empty value means "no server for this
+            // language", which is stored as an empty string rather than `None`
+            // so the choice survives a restart.
+            "lsp_rust" => self.lsp_rust = Some(value.to_string()),
+            "lsp_c" => self.lsp_c = Some(value.to_string()),
+            "lsp_cpp" => self.lsp_cpp = Some(value.to_string()),
+            "lsp_python" => self.lsp_python = Some(value.to_string()),
             _ => {} // unknown keys are forward compatible by design
+        }
+    }
+
+    /// The configured command for one language key (`rust`, `c`, `cpp`,
+    /// `python`). `None` means the file says nothing, so the default applies.
+    #[allow(dead_code)] // only the LSP layer reads the server commands
+    pub fn lsp_command(&self, language: &str) -> Option<String> {
+        match language {
+            "rust" => self.lsp_rust.clone(),
+            "c" => self.lsp_c.clone(),
+            "cpp" => self.lsp_cpp.clone(),
+            "python" => self.lsp_python.clone(),
+            _ => None,
         }
     }
 
@@ -216,7 +265,10 @@ impl Config {
              theme = {}\n\
              experimental_damage = {}\n\
              animations = {}\n\
-             check_updates = {}\n",
+             check_updates = {}\n\
+             lsp = {}\n\
+             syntax = {}\n\
+             {}{}{}{}",
             self.font_size,
             self.tab_width,
             self.show_line_numbers,
@@ -239,6 +291,26 @@ impl Config {
             self.experimental_damage,
             self.animations,
             self.check_updates,
+            self.lsp,
+            self.syntax,
+            // Server commands are only written when the user has set one:
+            // otherwise the file stays short and the defaults stay live.
+            self.lsp_rust
+                .as_ref()
+                .map(|c| format!("lsp_rust = {c}\n"))
+                .unwrap_or_default(),
+            self.lsp_c
+                .as_ref()
+                .map(|c| format!("lsp_c = {c}\n"))
+                .unwrap_or_default(),
+            self.lsp_cpp
+                .as_ref()
+                .map(|c| format!("lsp_cpp = {c}\n"))
+                .unwrap_or_default(),
+            self.lsp_python
+                .as_ref()
+                .map(|c| format!("lsp_python = {c}\n"))
+                .unwrap_or_default(),
         )
     }
 
@@ -497,6 +569,12 @@ mod tests {
             experimental_damage: true,
             animations: false,
             check_updates: false,
+            lsp: false,
+            syntax: false,
+            lsp_rust: Some("rust-analyzer --log=error".into()),
+            lsp_c: Some("clangd".into()),
+            lsp_cpp: Some("".into()),
+            lsp_python: None,
         };
         assert_eq!(Config::parse(&c.to_text()), c);
     }
