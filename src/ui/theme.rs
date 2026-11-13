@@ -57,6 +57,14 @@ pub struct Palette {
     pub syn_operator: Color,
     pub syn_punctuation: Color,
     pub syn_heading: Color,
+    /// Diagnostics (v1.2 section 7.3): squiggles, gutter markers, counts.
+    /// Red for errors, amber for warnings, a calm blue for info and hints.
+    pub diag_error: Color,
+    pub diag_warning: Color,
+    pub diag_info: Color,
+    /// Tooltip surface and its hairline, above the text area.
+    pub tooltip_bg: Color,
+    pub tooltip_border: Color,
 }
 
 pub const DARK: Palette = Palette {
@@ -77,6 +85,11 @@ pub const DARK: Palette = Palette {
     status_text: rgb(0xb8bec8),
     selection: rgb(0x33475f),
     close_hover: rgb(0xd94f4f),
+    diag_error: rgb(0xf05a5a),
+    diag_warning: rgb(0xe0b050),
+    diag_info: rgb(0x6aa8e8),
+    tooltip_bg: rgb(0x23262e),
+    tooltip_border: rgb(0x3a4150),
     // Dark syntax colours: soft on the eyes, distinct at 8 px tall glyphs.
     syn_keyword: rgb(0xc792ea),
     syn_string: rgb(0x9ece6a),
@@ -111,6 +124,12 @@ pub const LIGHT: Palette = Palette {
     status_text: rgb(0x414b59),
     selection: rgb(0xbfd3e8),
     close_hover: rgb(0xd94f4f),
+    // Lighter, saturated variants: the same hues stay legible on white.
+    diag_error: rgb(0xc03434),
+    diag_warning: rgb(0x9a6a05),
+    diag_info: rgb(0x2166b0),
+    tooltip_bg: rgb(0xffffff),
+    tooltip_border: rgb(0xc8cdd6),
     // Light syntax colours: darker versions of the same hues.
     syn_keyword: rgb(0x8a3fb0),
     syn_string: rgb(0x3e7d1f),

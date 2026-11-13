@@ -56,6 +56,22 @@ pub struct Chrome<'a> {
     /// Whether to draw the badge next to the note. False for a progress or a
     /// failure message, true for "available" and "ready".
     pub update_badge: bool,
+    /// Diagnostics for the active file (v1.2 section 7.3). Squiggles, gutter
+    /// markers and the status bar counts all read this one list.
+    pub diagnostics: &'a crate::lsp::diagnostics::Diagnostics,
+    /// The tooltip to draw now, if the pointer has rested on a diagnostic.
+    pub tooltip: Option<&'a DiagTooltip>,
+}
+
+/// A diagnostic hover message that has earned its 300 ms and is on screen.
+pub struct DiagTooltip {
+    /// Window points, already inside the window (the view clamps it).
+    pub x: f32,
+    pub y: f32,
+    /// The message's first line only, already clipped by the app.
+    pub text: String,
+    /// Errors get the red border, warnings the amber one.
+    pub severity: crate::lsp::diagnostics::Severity,
 }
 
 pub fn draw(r: &mut Renderer, ws: &Workspace, l: &Layout, chrome: &Chrome) {
@@ -107,10 +123,38 @@ pub fn draw(r: &mut Renderer, ws: &Workspace, l: &Layout, chrome: &Chrome) {
         r.text_ui(cx - w * 0.5, cy - 6.5, label, p.text);
     }
 
+    // The diagnostic tooltip sits above everything except the frame border.
+    if let Some(tooltip) = chrome.tooltip {
+        draw_tooltip(r, l, p, tooltip);
+    }
+
     // Border last, so it sits on top of the panels' edges.
     if !chrome.maximized {
         r.rounded_outline(0.0, 0.0, l.width, l.height, radius, 1.0, p.border);
     }
+}
+
+/// The hover tooltip for a diagnostic (v1.2 section 7.3): a small panel with a
+/// severity-coloured edge and one clipped line of message.
+///
+/// It is clamped into the window, so a diagnostic on the last visible line
+/// still shows its message above the status bar and a long one cannot run past
+/// the right edge.
+fn draw_tooltip(r: &mut Renderer, l: &Layout, p: &Palette, t: &DiagTooltip) {
+    let pad = 8.0;
+    let text_w = r.ui_text_width(&t.text);
+    let w = text_w + pad * 2.0 + 4.0;
+    let h = l.cell_h + pad * 2.0 - 4.0;
+    // Anchor near the pointer, then push it inside the window.
+    let x = t.x.min(l.width - w - 4.0).max(4.0);
+    let y =
+        t.y.min(l.height - l.status_h - h - 4.0)
+            .max(l.title_h + 2.0);
+    r.rounded_rect(x, y, w, h, 4.0, p.tooltip_bg);
+    r.rounded_outline(x, y, w, h, 4.0, 1.0, p.tooltip_border);
+    // A 2 px severity stripe on the left edge: the same colour as the squiggle.
+    r.rect(x + 1.0, y + 3.0, 2.0, h - 6.0, diag_color(p, t.severity));
+    r.text_ui(x + pad + 2.0, y + pad - 2.0, &t.text, p.text);
 }
 
 fn draw_title_bar(r: &mut Renderer, l: &Layout, chrome: &Chrome) {
@@ -224,6 +268,24 @@ fn draw_editor(r: &mut Renderer, ed: &Editor, l: &Layout, p: &Palette, chrome: &
             r.text(nx, y, num, p.gutter_text);
         }
     }
+    // Gutters markers, one per line with a diagnostic (v1.2 section 7.3): the
+    // worst severity on the line, as a 3 px bar at the left edge of the band.
+    // Drawn before the text so it can never cover a line number.
+    if l.show_numbers && !chrome.diagnostics.is_empty() {
+        for idx in first..last {
+            let Some(sev) = chrome.diagnostics.worst_on_line(&ed.buffer, idx) else {
+                continue;
+            };
+            let y = (l.text_y + (idx - first) as f32 * l.cell_h - frac * l.cell_h).round();
+            r.rect(
+                l.sidebar_w + 2.0,
+                y + l.cell_h * 0.5 - 5.0,
+                3.0,
+                10.0,
+                diag_color(p, sev),
+            );
+        }
+    }
 
     // Clip to the text area so a long line can never paint over the gutter or
     // the status bar. The clip is in points; the renderer scales it.
@@ -268,6 +330,48 @@ fn draw_editor(r: &mut Renderer, ed: &Editor, l: &Layout, p: &Palette, chrome: &
             None => {
                 let visible = visible_slice(&line, ed.scroll_x, l.cols);
                 r.text(l.text_x, y, visible, p.text);
+            }
+        }
+    }
+
+    // Squiggles: one per diagnostic range, on the visible lines only. They are
+    // queued after the text so they paint over it, and the renderer keeps them
+    // in the over-text batch, so they add no draw call (v1.2 section 7.3).
+    if !chrome.diagnostics.is_empty() {
+        let gutter = r.text_pen_x(l.text_x, "", ed.scroll_x) - l.text_x;
+        for idx in first..last {
+            for d in chrome.diagnostics.items() {
+                let (d_first, d_last) = d.lines(&ed.buffer);
+                if idx < d_first || idx > d_last {
+                    continue;
+                }
+                let line = ed.buffer.line(idx);
+                let line_start = ed.buffer.char_index(idx, 0);
+                let line_len = line.chars().count();
+                // Clamp the range to this line: a multi-line diagnostic gets a
+                // squiggle per line, which is what editors show.
+                let a = d.range.start.max(line_start) - line_start;
+                let b = (d.range.end.min(line_start + line_len)) - line_start;
+                let (a, b) = (a.min(line_len), b.min(line_len));
+                // A zero-width diagnostic still gets a visible mark.
+                let (a, b) = if b <= a {
+                    (a, (a + 1).min(line_len.max(a + 1)))
+                } else {
+                    (a, b)
+                };
+                let x0 = r.text_pen_x(l.text_x, &line, a) - gutter;
+                let x1 = r.text_pen_x(l.text_x, &line, b) - gutter;
+                if x1 <= l.text_x || x0 >= l.text_x + l.text_w {
+                    continue; // scrolled out of view
+                }
+                let y = (l.text_y + (idx - first) as f32 * l.cell_h - frac * l.cell_h).round();
+                r.squiggle(
+                    x0.max(l.text_x),
+                    y + l.cell_h - 3.0,
+                    (x1 - x0.max(l.text_x)).max(2.0),
+                    3.0,
+                    diag_color(p, d.severity),
+                );
             }
         }
     }
@@ -325,6 +429,35 @@ fn draw_status_bar(r: &mut Renderer, ed: &Editor, l: &Layout, p: &Palette, chrom
     let pos = format!("Ln {}, Col {}", ed.cursor.line + 1, ed.cursor.col + 1);
     let px = (l.width - GUTTER_PAD - r.ui_text_width(&pos)).max(sx);
     r.text_ui(px, text_y, &pos, p.status_text);
+
+    // Diagnostic counts, left of the position (v1.2 section 7.3): an icon and
+    // a number per severity, with the errors first. Nothing is drawn for a
+    // clean file, so a healthy status bar is unchanged.
+    let (errors, warnings) = chrome.diagnostics.counts();
+    if errors + warnings > 0 {
+        let mut cx = px - 10.0;
+        let icon = 11.0;
+        let iy = text_y + (l.cell_h - icon) * 0.5;
+        if warnings > 0 {
+            let label = warnings.to_string();
+            let tw = r.ui_text_width(&label);
+            cx -= tw;
+            r.text_ui(cx, text_y, &label, p.diag_warning);
+            cx -= icon + 3.0;
+            r.icon(cx, iy, Icon::TriangleAlert, icon, p.diag_warning);
+            cx -= 10.0;
+        }
+        if errors > 0 {
+            let label = errors.to_string();
+            let tw = r.ui_text_width(&label);
+            cx -= tw;
+            r.text_ui(cx, text_y, &label, p.diag_error);
+            cx -= icon + 3.0;
+            r.icon(cx, iy, Icon::CircleX, icon, p.diag_error);
+        }
+        // The counts must never be pushed under the position text.
+        let _ = cx;
+    }
 
     // The updater's line sits left of the position, right-aligned so it grows
     // toward the middle of the bar and never pushes the cursor position away.
@@ -415,6 +548,17 @@ fn draw_runs(
     }
     let text: String = chars[run_start..].iter().collect();
     r.text(l.text_x, y, &text, p.syntax(run_kind));
+}
+
+/// Squiggle and gutter colour for a severity. Info and hints share the calm
+/// blue: they are information, not a problem.
+fn diag_color(p: &Palette, sev: crate::lsp::diagnostics::Severity) -> crate::render::Color {
+    use crate::lsp::diagnostics::Severity;
+    match sev {
+        Severity::Error => p.diag_error,
+        Severity::Warning => p.diag_warning,
+        Severity::Information | Severity::Hint => p.diag_info,
+    }
 }
 
 fn visible_slice(line: &str, scroll_x: usize, cols: usize) -> &str {

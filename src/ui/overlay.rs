@@ -44,6 +44,9 @@ pub struct Info<'a> {
     pub flags: &'a str,
     pub gl_version: &'a str,
     pub gl_renderer: &'a str,
+    /// Language servers and their state (`rust: utf-8 ready`), or `None` with
+    /// the feature off or no server started yet.
+    pub lsp: Option<&'a str>,
 }
 
 const LINE_H: f32 = 15.0;
@@ -53,7 +56,7 @@ const WIDTH: f32 = 330.0;
 /// Draw the panel in the top-right of the text area. `x`/`y` are the panel's
 /// top-left corner in points; the size is fixed so the text never clips.
 pub fn draw(r: &mut Renderer, p: &Palette, x: f32, y: f32, info: &Info) {
-    let lines = 9;
+    let lines = if info.lsp.is_some() { 10 } else { 9 };
     let h = PAD * 2.0 + lines as f32 * LINE_H;
     // A slightly darker plate so the numbers stay readable over text.
     r.rounded_rect(x, y, WIDTH, h, 6.0, p.sidebar_bg);
@@ -87,6 +90,9 @@ pub fn draw(r: &mut Renderer, p: &Palette, x: f32, y: f32, info: &Info) {
         _ => "startup measuring".to_string(),
     };
     line(r, &start, p.muted);
+    if let Some(lsp) = info.lsp {
+        line(r, &format!("lsp {lsp}"), p.muted);
+    }
     line(
         r,
         &format!(
