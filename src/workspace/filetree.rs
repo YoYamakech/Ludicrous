@@ -182,7 +182,7 @@ impl FileTree {
         if entries.len() > shown {
             self.rows.push(Row {
                 depth,
-                name: format!("… {} more", entries.len() - shown),
+                name: format!("... {} more", entries.len() - shown),
                 path: dir.to_path_buf(),
                 is_dir: false,
                 expanded: false,

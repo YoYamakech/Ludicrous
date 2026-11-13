@@ -45,20 +45,14 @@ impl Workspace {
         if path.is_dir() {
             ws.root = Some(path.to_path_buf());
             ws.tree.set_root(Some(path.to_path_buf()));
-            // Drop the unnamed placeholder only if it is still empty.
-            if ws.buffers[0].is_pristine() {
-                ws.buffers.clear();
-                ws.active = 0;
-            }
+            // A project folder opens with its single empty buffer kept: the
+            // file tree is useful on its own, and the editor area must never
+            // vanish (the first file opened will reuse this buffer).
         } else {
             // A file: use its parent as the project root so the tree is useful.
             if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
                 ws.root = Some(parent.to_path_buf());
                 ws.tree.set_root(Some(parent.to_path_buf()));
-            }
-            if ws.buffers[0].is_pristine() {
-                ws.buffers.clear();
-                ws.active = 0;
             }
             ws.open_file(path)?;
         }
@@ -140,6 +134,8 @@ impl Workspace {
         }
         let ed = &mut self.buffers[self.active];
         if ed.is_dirty() && ed.request_quit() == Control::Continue {
+            // The shared guard talks about Ctrl+Q; closing has its own key.
+            ed.status = Some("Unsaved changes: press Ctrl+W again to discard".to_string());
             return Control::Continue;
         }
         self.buffers.remove(self.active);

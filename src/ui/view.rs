@@ -3,10 +3,13 @@
 // plus the geometry in `Layout`. Only visible lines are touched.
 
 use crate::editor::Editor;
-use crate::render::Renderer;
+use crate::render::{Icon, Renderer};
+use crate::ui::focus::Focus;
 use crate::ui::layout::Layout;
+use crate::ui::sidebar::{self, SidebarState};
 use crate::ui::theme;
 use crate::window::{Hit, WindowButton};
+use crate::workspace::Workspace;
 
 const GUTTER_PAD: f32 = 8.0;
 const CURSOR_W: f32 = 2.0;
@@ -19,9 +22,16 @@ pub struct Chrome<'a> {
     pub maximized: bool,
     /// The item under the mouse, for hover feedback.
     pub hover: Option<Hit>,
+    pub focus: Focus,
+    pub sidebar: SidebarState,
 }
 
-pub fn draw(r: &mut Renderer, ed: &Editor, l: &Layout, chrome: &Chrome) {
+pub fn draw(r: &mut Renderer, ws: &Workspace, l: &Layout, chrome: &Chrome) {
+    // The sidebar needs the active buffer for the text area; without one there
+    // is nothing to draw at all.
+    let Some(ed) = ws.active_editor() else {
+        return;
+    };
     // The window itself: one rounded rectangle, with a 1 px border. The
     // renderer's window mask clips everything to the same shape.
     let radius = if chrome.maximized {
@@ -34,7 +44,8 @@ pub fn draw(r: &mut Renderer, ed: &Editor, l: &Layout, chrome: &Chrome) {
 
     draw_title_bar(r, l, chrome);
     if l.sidebar_w > 0.0 {
-        draw_sidebar(r, l);
+        let geo = sidebar::Geometry::from_layout(l, ws.file_labels().len());
+        sidebar::draw(r, ws, l, &geo, &chrome.sidebar, chrome.focus);
     }
     draw_editor(r, ed, l);
     draw_status_bar(r, ed, l);
@@ -50,16 +61,12 @@ fn draw_title_bar(r: &mut Renderer, l: &Layout, chrome: &Chrome) {
     r.rect(0.0, 0.0, l.width, h, theme::SIDEBAR_BG);
     r.rect(0.0, h - 1.0, l.width, 1.0, theme::BORDER);
 
-    // Sidebar toggle: three short lines, drawn as rects (no icon font yet).
-    let tx = 10.0;
-    let ty = (h - 12.0) * 0.5;
+    // Sidebar toggle: the panel icon, on a subtle hover pill.
     let toggle_hover = matches!(chrome.hover, Some(Hit::SidebarToggle));
     if toggle_hover {
         r.rounded_rect(4.0, 4.0, 22.0, h - 8.0, 4.0, theme::PILL_HOVER);
     }
-    for i in 0..3 {
-        r.rect(tx, ty + i as f32 * 5.0, 12.0, 1.5, theme::MUTED);
-    }
+    r.icon(6.0, (h - 16.0) * 0.5, Icon::Sidebar, 16.0, theme::MUTED);
 
     // Title text, centred vertically in the bar.
     let text_y = (h - l.cell_h) * 0.5 + 1.0;
@@ -98,64 +105,14 @@ fn draw_title_bar(r: &mut Renderer, l: &Layout, chrome: &Chrome) {
         } else {
             theme::MUTED
         };
-        match button {
-            WindowButton::Minimize => r.rect(cx - 5.0, cy, 10.0, 1.5, fg),
-            WindowButton::Maximize => {
-                if chrome.maximized {
-                    // Restore: two overlapping squares.
-                    r.rounded_outline(cx - 5.0, cy - 4.0, 8.0, 8.0, 1.0, 1.0, fg);
-                    r.rounded_outline(cx - 2.0, cy - 6.0, 8.0, 8.0, 1.0, 1.0, fg);
-                } else {
-                    r.rounded_outline(cx - 5.0, cy - 5.0, 10.0, 10.0, 1.0, 1.0, fg);
-                }
-            }
-            WindowButton::Close => {
-                // Two diagonal strokes, approximated with thin rects.
-                for i in 0..10 {
-                    let t = i as f32;
-                    r.rect(cx - 5.0 + t, cy - 5.0 + t, 1.5, 1.5, fg);
-                    r.rect(cx + 4.0 - t, cy - 5.0 + t, 1.5, 1.5, fg);
-                }
-            }
-        }
-    }
-}
-
-fn draw_sidebar(r: &mut Renderer, l: &Layout) {
-    let top = l.title_h;
-    let h = l.height - top;
-    r.rect(0.0, top, l.sidebar_w, h, theme::SIDEBAR_BG);
-    r.rect(l.sidebar_w - 1.0, top, 1.0, h, theme::BORDER);
-
-    // Placeholder rows until Phase D builds the real tree. The rail mode only
-    // has room for the icon squares.
-    let rail = l.sidebar_w < theme::SIDEBAR_W;
-    let mut y = top + theme::PAD;
-    for i in 0..6 {
-        let row_h = theme::ROW_H;
-        if y + row_h > l.height - l.status_h {
-            break;
-        }
-        if i == 0 {
-            r.rounded_rect(
-                theme::PAD * 0.5,
-                y,
-                l.sidebar_w - theme::PAD,
-                row_h,
-                theme::PILL_RADIUS,
-                theme::PILL_ACTIVE,
-            );
-        }
-        let icon_x = if rail {
-            (l.sidebar_w - 14.0) * 0.5
-        } else {
-            12.0
+        let icon = match button {
+            WindowButton::Minimize => Icon::Minimize,
+            WindowButton::Maximize if chrome.maximized => Icon::Restore,
+            WindowButton::Maximize => Icon::Maximize,
+            WindowButton::Close => Icon::Close,
         };
-        r.icon(icon_x, y + 7.0, 14.0, theme::MUTED);
-        if !rail {
-            r.text_ui(34.0, y + 6.0, "src", theme::TEXT);
-        }
-        y += row_h;
+        let size = 14.0;
+        r.icon(cx - size * 0.5, cy - size * 0.5, icon, size, fg);
     }
 }
 
@@ -236,9 +193,13 @@ fn draw_editor(r: &mut Renderer, ed: &Editor, l: &Layout) {
 }
 
 fn draw_status_bar(r: &mut Renderer, ed: &Editor, l: &Layout) {
+    // The bar belongs to the editing area, so it starts right of the sidebar:
+    // the sidebar's project card runs all the way to the bottom edge.
+    let sx = l.sidebar_w;
+    let sw = l.width - sx;
     let sy = l.height - l.status_h;
-    r.rect(0.0, sy, l.width, l.status_h, theme::STATUS_BG);
-    r.rect(0.0, sy, l.width, 1.0, theme::BORDER);
+    r.rect(sx, sy, sw, l.status_h, theme::STATUS_BG);
+    r.rect(sx, sy, sw, 1.0, theme::BORDER);
     let text_y = sy + ((l.status_h - l.cell_h) / 2.0).max(0.0) + 1.0;
 
     let name = match &ed.buffer.path {
@@ -260,7 +221,7 @@ fn draw_status_bar(r: &mut Renderer, ed: &Editor, l: &Layout) {
     }
 
     let pos = format!("Ln {}, Col {}", ed.cursor.line + 1, ed.cursor.col + 1);
-    let px = (l.width - GUTTER_PAD - r.ui_text_width(&pos)).max(0.0);
+    let px = (l.width - GUTTER_PAD - r.ui_text_width(&pos)).max(sx);
     r.text_ui(px, text_y, &pos, theme::STATUS_TEXT);
 }
 

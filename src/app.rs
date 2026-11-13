@@ -21,7 +21,9 @@ use winit::window::{CursorIcon, Fullscreen, Window, WindowId};
 use crate::editor::{Command, Control};
 use crate::input;
 use crate::render::Renderer;
+use crate::ui::focus::Focus;
 use crate::ui::layout::Layout;
+use crate::ui::sidebar::{self, SidebarState};
 use crate::ui::theme;
 use crate::ui::view;
 use crate::window::{self, Hit, HitState, ResizeDirection, WindowButton};
@@ -30,6 +32,7 @@ use crate::workspace::{self, Workspace};
 // The font is compiled into the binary: no file lookup at startup, no missing
 // font on a fresh machine.
 const FONT: &[u8] = include_bytes!("../assets/font.ttf");
+const ICONS: &[u8] = include_bytes!("../assets/icons.ttf");
 const FONT_PX: f32 = 15.0;
 
 struct GlState {
@@ -53,6 +56,13 @@ pub struct App {
     hover: Option<Hit>,
     /// Sidebar mode. `None` means "auto" (collapse on narrow windows).
     sidebar_manual: Option<bool>,
+    /// Auto sidebar mode last seen, so a resize that crosses a breakpoint can
+    /// drop a manual Ctrl+B choice.
+    auto_mode: u8,
+    /// Keyboard focus: the editor or the file tree.
+    focus: Focus,
+    /// Sidebar hover/scroll/selection state, kept between frames.
+    sidebar: SidebarState,
     /// True when the GL config actually has an alpha channel. Without it the
     /// window is opaque and square, and we say so once at startup.
     transparent: bool,
@@ -70,6 +80,9 @@ impl App {
             cursor_pos: None,
             hover: None,
             sidebar_manual: None,
+            auto_mode: 0,
+            focus: Focus::default(),
+            sidebar: SidebarState::default(),
             transparent: false,
         }
     }
@@ -213,7 +226,7 @@ impl App {
             })
         };
 
-        let mut renderer = Renderer::new(gl, FONT, FONT_PX);
+        let mut renderer = Renderer::new(gl, FONT, ICONS, FONT_PX);
         renderer.set_scale(window.scale_factor() as f32);
 
         // Load the file only now: the window is already on screen, so a slow
@@ -354,6 +367,193 @@ impl App {
         self.sidebar_manual = Some(!expanded);
     }
 
+    /// Sidebar width in points, or 0 when it is hidden.
+    fn sidebar_width_of_window(&self) -> f32 {
+        self.window
+            .as_ref()
+            .map(|w| {
+                let s = w.scale_factor() as f32;
+                self.sidebar_width(w.inner_size().width as f32 / s)
+            })
+            .unwrap_or(0.0)
+    }
+
+    /// Sidebar geometry for the current window, or `None` when it is hidden.
+    fn sidebar_geometry(&self) -> Option<(Layout, sidebar::Geometry)> {
+        let l = self.layout()?;
+        if l.sidebar_w <= 0.0 {
+            return None;
+        }
+        let open = self.workspace.as_ref()?.file_labels().len();
+        let geo = sidebar::Geometry::from_layout(&l, open);
+        Some((l, geo))
+    }
+
+    /// What the mouse is over inside the sidebar.
+    fn sidebar_hit(&self) -> Option<sidebar::Hit> {
+        let pos = self.cursor_pos?;
+        let window = self.window.as_ref()?;
+        let scale = window.scale_factor() as f32;
+        let (x, y) = window::to_points(pos, scale);
+        let (_l, geo) = self.sidebar_geometry()?;
+        let ws = self.workspace.as_ref()?;
+        Some(geo.hit(
+            x,
+            y,
+            ws.file_labels().len(),
+            ws.tree.rows().len(),
+            self.sidebar.scroll,
+        ))
+    }
+
+    /// Refresh the hover flags from the mouse position. Returns true when
+    /// something changed, so the caller only redraws on real changes.
+    fn update_sidebar_hover(&mut self) -> bool {
+        let hit = self.sidebar_hit();
+        let (mut tree, mut open, mut icon) = (None, None, None);
+        match hit {
+            Some(sidebar::Hit::TreeRow(i)) => tree = Some(i),
+            Some(sidebar::Hit::OpenFile(i)) => open = Some(i),
+            Some(sidebar::Hit::Settings) => icon = Some(0),
+            Some(sidebar::Hit::RailFiles) => icon = Some(0),
+            Some(sidebar::Hit::RailSettings) => icon = Some(1),
+            _ => {}
+        }
+        let changed = (
+            self.sidebar.hover_tree,
+            self.sidebar.hover_open,
+            self.sidebar.hover_icon,
+        ) != (tree, open, icon);
+        self.sidebar.hover_tree = tree;
+        self.sidebar.hover_open = open;
+        self.sidebar.hover_icon = icon;
+        changed
+    }
+
+    /// Activate a tree row: open a file, or expand/collapse a directory.
+    fn activate_tree_row(&mut self, index: usize) {
+        let Some(ws) = self.workspace.as_mut() else {
+            return;
+        };
+        let Some(row) = ws.tree.rows().get(index).cloned() else {
+            return;
+        };
+        if row.unreadable || row.more > 0 {
+            return;
+        }
+        if row.is_dir {
+            ws.tree.toggle(&row.path);
+            // Collapsing can remove rows above the selection; keep it valid.
+            let n = ws.tree.rows().len();
+            self.sidebar.selected = self.sidebar.selected.min(n.saturating_sub(1));
+            self.update_sidebar_scroll();
+            return;
+        }
+        match ws.open_file(&row.path) {
+            Ok(_) => self.focus = Focus::Editor,
+            Err(e) => {
+                if let Some(ed) = ws.active_editor_mut() {
+                    ed.status = Some(format!("Could not open: {e}"));
+                }
+            }
+        }
+    }
+
+    /// Keep the selected tree row inside the viewport.
+    fn update_sidebar_scroll(&mut self) {
+        let Some((_, geo)) = self.sidebar_geometry() else {
+            return;
+        };
+        let row_top = self.sidebar.selected as f32 * theme::ROW_H;
+        let row_bottom = row_top + theme::ROW_H;
+        if row_top < self.sidebar.scroll {
+            self.sidebar.scroll = row_top;
+        } else if row_bottom > self.sidebar.scroll + geo.tree_h {
+            self.sidebar.scroll = row_bottom - geo.tree_h;
+        }
+        let rows = self
+            .workspace
+            .as_ref()
+            .map(|w| w.tree.rows().len())
+            .unwrap_or(0);
+        let max = sidebar::max_scroll(geo.tree_h, rows);
+        self.sidebar.scroll = self.sidebar.scroll.clamp(0.0, max);
+    }
+
+    /// Keyboard input while the sidebar has focus. Returns true when the key
+    /// was consumed.
+    fn sidebar_key(&mut self, event: &winit::event::KeyEvent) -> bool {
+        use winit::keyboard::{Key, NamedKey};
+        let Some(ws) = self.workspace.as_ref() else {
+            return false;
+        };
+        let rows = ws.tree.rows().len();
+        match event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                self.focus = Focus::Editor;
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                if rows > 0 {
+                    self.sidebar.selected = (self.sidebar.selected + 1).min(rows - 1);
+                    self.update_sidebar_scroll();
+                }
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                self.sidebar.selected = self.sidebar.selected.saturating_sub(1);
+                self.update_sidebar_scroll();
+            }
+            Key::Named(NamedKey::Enter) => {
+                let i = self.sidebar.selected;
+                self.activate_tree_row(i);
+            }
+            Key::Named(NamedKey::ArrowRight) => {
+                // Expand a collapsed folder, or step into an expanded one.
+                let i = self.sidebar.selected;
+                let Some(row) = ws.tree.rows().get(i).cloned() else {
+                    return true;
+                };
+                if row.is_dir && !row.expanded {
+                    self.activate_tree_row(i);
+                }
+            }
+            Key::Named(NamedKey::ArrowLeft) => {
+                let i = self.sidebar.selected;
+                let Some(row) = ws.tree.rows().get(i).cloned() else {
+                    return true;
+                };
+                if row.is_dir && row.expanded {
+                    self.activate_tree_row(i);
+                } else if row.depth > 0 {
+                    // Jump to the parent row: the nearest earlier row that is
+                    // one level shallower.
+                    if let Some(ws) = self.workspace.as_ref() {
+                        let rows = ws.tree.rows();
+                        for j in (0..i).rev() {
+                            if rows[j].depth + 1 == row.depth && rows[j].is_dir {
+                                self.sidebar.selected = j;
+                                break;
+                            }
+                        }
+                    }
+                    self.update_sidebar_scroll();
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Which mode auto would pick for `w` points: 0 hidden, 1 rail, 2 expanded.
+    fn auto_sidebar_mode(w: f32) -> u8 {
+        if w >= 900.0 {
+            2
+        } else if w >= 600.0 {
+            1
+        } else {
+            0
+        }
+    }
+
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
         // Read the chrome state before borrowing the GL state mutably.
         let title = self.title();
@@ -366,10 +566,10 @@ impl App {
                 self.sidebar_width(w.inner_size().width as f32 / s)
             })
             .unwrap_or(0.0);
-        let (Some(window), Some(gl), Some(ed)) = (
+        let (Some(window), Some(gl), Some(ws)) = (
             self.window.as_ref(),
             self.gl.as_mut(),
-            self.workspace.as_mut().and_then(|w| w.active_editor_mut()),
+            self.workspace.as_mut(),
         ) else {
             return;
         };
@@ -381,15 +581,25 @@ impl App {
 
         // Layout works in points; the renderer scales internally.
         let (w, h) = (size.width as f32 / scale, size.height as f32 / scale);
-        let layout = Layout::new(r, ed.buffer.line_count(), w, h, sidebar_w);
-        ed.ensure_visible(layout.rows, layout.cols);
+        let line_count = ws
+            .active_editor()
+            .map(|e| e.buffer.line_count())
+            .unwrap_or(1);
+        let layout = Layout::new(r, line_count, w, h, sidebar_w);
+        let (rows, cols) = (layout.rows, layout.cols);
+        if let Some(ed) = ws.active_editor_mut() {
+            ed.ensure_visible(rows, cols);
+        }
+        let modified = ws.active_editor().map(|e| e.is_dirty()).unwrap_or(false);
         let chrome = view::Chrome {
             title: &title,
-            modified: ed.is_dirty(),
+            modified,
             maximized: window.is_maximized(),
             hover,
+            focus: self.focus,
+            sidebar: self.sidebar.clone(),
         };
-        view::draw(r, ed, &layout, &chrome);
+        view::draw(r, ws, &layout, &chrome);
 
         r.flush();
         let _ = gl.surface.swap_buffers(&gl.context);
@@ -443,6 +653,35 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state != ElementState::Pressed {
                     return;
+                }
+                // Ctrl+Shift+E focuses the file tree (wherever focus was).
+                if self.mods.control_key()
+                    && self.mods.shift_key()
+                    && matches!(&event.logical_key,
+                        winit::keyboard::Key::Character(c) if c.as_str().eq_ignore_ascii_case("e"))
+                {
+                    if self.sidebar_width_of_window() > 0.0 {
+                        self.focus = Focus::Sidebar;
+                        if let Some(w) = self.window.as_ref() {
+                            w.request_redraw();
+                        }
+                    }
+                    return;
+                }
+                // With the sidebar focused, its own keys win over the editor's.
+                if self.focus == Focus::Sidebar && self.sidebar_width_of_window() > 0.0 {
+                    if self.sidebar_key(&event) {
+                        if let Some(w) = self.window.as_ref() {
+                            w.request_redraw();
+                        }
+                        return;
+                    }
+                    // Typing belongs to the focused part: plain keys do nothing
+                    // in the tree instead of leaking into the editor. Control
+                    // shortcuts (save, quit, cycling) still work.
+                    if !self.mods.control_key() {
+                        return;
+                    }
                 }
                 // Shell shortcuts that are not editor commands.
                 if matches!(
@@ -528,6 +767,42 @@ impl ApplicationHandler for App {
                 if state != ElementState::Pressed || button != MouseButton::Left {
                     return;
                 }
+                match self.sidebar_hit() {
+                    Some(sidebar::Hit::Empty) => {}
+                    Some(sidebar_hit) => {
+                        match sidebar_hit {
+                            sidebar::Hit::OpenFile(i) => {
+                                if let Some(ws) = self.workspace.as_mut() {
+                                    ws.active = i.min(ws.buffers.len().saturating_sub(1));
+                                }
+                                self.focus = Focus::Editor;
+                            }
+                            sidebar::Hit::TreeRow(i) => {
+                                self.focus = Focus::Sidebar;
+                                self.sidebar.selected = i;
+                                self.activate_tree_row(i);
+                            }
+                            sidebar::Hit::RailFiles => {
+                                // The files icon expands the sidebar.
+                                self.sidebar_manual = Some(true);
+                                self.focus = Focus::Sidebar;
+                            }
+                            sidebar::Hit::RailSettings | sidebar::Hit::Settings => {
+                                // The settings page arrives in Phase E; until
+                                // then the row is a plain focus target.
+                                self.focus = Focus::Editor;
+                            }
+                            sidebar::Hit::Header | sidebar::Hit::Empty => {
+                                self.focus = Focus::Editor;
+                            }
+                        }
+                        if let Some(w) = self.window.as_ref() {
+                            w.request_redraw();
+                        }
+                        return;
+                    }
+                    None => {}
+                }
                 let Some(hit) = self.hit_at_cursor() else {
                     return;
                 };
@@ -571,6 +846,8 @@ impl ApplicationHandler for App {
                         }
                     }
                     Hit::Content => {
+                        // Clicking the text area takes keyboard focus back.
+                        self.focus = Focus::Editor;
                         let Some(layout) = self.layout() else {
                             return;
                         };
@@ -602,8 +879,14 @@ impl ApplicationHandler for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = Some(position);
+                let sidebar_changed = self.update_sidebar_hover();
                 // Hover feedback: only redraw when the target actually changes.
                 let hit = self.hit_at_cursor();
+                if sidebar_changed {
+                    if let Some(w) = self.window.as_ref() {
+                        w.request_redraw();
+                    }
+                }
                 if hit != self.hover {
                     self.hover = hit;
                     self.update_cursor_icon();
@@ -621,6 +904,29 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                // Over the file tree the wheel scrolls the tree, not the text.
+                if matches!(
+                    self.sidebar_hit(),
+                    Some(sidebar::Hit::TreeRow(_)) | Some(sidebar::Hit::Header)
+                ) {
+                    let dy = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => y * theme::ROW_H,
+                        MouseScrollDelta::PixelDelta(p) => p.y as f32,
+                    };
+                    if let Some((_, geo)) = self.sidebar_geometry() {
+                        let rows = self
+                            .workspace
+                            .as_ref()
+                            .map(|w| w.tree.rows().len())
+                            .unwrap_or(0);
+                        let max = sidebar::max_scroll(geo.tree_h, rows);
+                        self.sidebar.scroll = (self.sidebar.scroll - dy).clamp(0.0, max);
+                        if let Some(w) = self.window.as_ref() {
+                            w.request_redraw();
+                        }
+                        return;
+                    }
+                }
                 // Convert pixel deltas to lines using the current cell height.
                 let lines = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y,
@@ -650,8 +956,12 @@ impl ApplicationHandler for App {
                     .map(|w| w.scale_factor() as f32)
                     .unwrap_or(1.0);
                 let w_pts = size.width as f32 / scale;
-                if w_pts < 600.0 || w_pts >= 900.0 {
+                // A manual Ctrl+B choice lasts only until the window is
+                // resized across one of the auto-collapse breakpoints.
+                let mode = Self::auto_sidebar_mode(w_pts);
+                if mode != self.auto_mode {
                     self.sidebar_manual = None;
+                    self.auto_mode = mode;
                 }
                 if let Some(gl) = self.gl.as_mut() {
                     if let (Some(w), Some(h)) =

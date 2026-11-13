@@ -11,10 +11,13 @@ use glow::HasContext;
 use crate::render::caps::GlCaps;
 use crate::render::font::Atlas;
 use crate::render::gl::Batch;
+pub use crate::render::icons::Icon;
+use crate::render::icons::IconAtlas;
 
 pub mod caps;
 pub mod font;
 pub mod gl;
+pub mod icons;
 
 pub type Color = [f32; 4]; // RGBA 0.0..=1.0, straight (not premultiplied)
 
@@ -52,8 +55,10 @@ pub struct Renderer {
     rects: Batch,
     glyphs: Batch,
     ui_glyphs: Batch,
+    icon_glyphs: Batch,
     atlas: Atlas,
     ui_atlas: Atlas,
+    icon_atlas: IconAtlas,
     // Logical size of the framebuffer, in points (not physical pixels).
     width: f32,
     height: f32,
@@ -61,6 +66,7 @@ pub struct Renderer {
     scale: f32,
     // Kept so the atlases can be re-rasterized when the scale factor changes.
     font_bytes: Vec<u8>,
+    icon_bytes: Vec<u8>,
     font_px: f32,
     ui_px: f32,
     // Clip stack in physical pixels; each entry is [x, y, w, h].
@@ -75,7 +81,7 @@ pub struct Renderer {
 impl Renderer {
     /// `font_px` is the editor font size in points; the atlas is rasterized at
     /// `font_px * scale` so text stays sharp on HiDPI screens.
-    pub fn new(gl: glow::Context, font_bytes: &[u8], font_px: f32) -> Self {
+    pub fn new(gl: glow::Context, font_bytes: &[u8], icon_bytes: &[u8], font_px: f32) -> Self {
         let caps = GlCaps::detect(&gl);
         let rect_program = gl::program(&gl, RECT_VERT, RECT_FRAG);
         let text_program = gl::program(&gl, TEXT_VERT, TEXT_FRAG);
@@ -86,11 +92,13 @@ impl Renderer {
         // glyph: rect(4) uv(4) color(4) clip(4)
         let glyphs = Batch::new(&gl, &[(1, 4), (2, 4), (3, 4), (4, 4)], MAX_GLYPHS);
         let ui_glyphs = Batch::new(&gl, &[(1, 4), (2, 4), (3, 4), (4, 4)], MAX_GLYPHS);
+        let icon_glyphs = Batch::new(&gl, &[(1, 4), (2, 4), (3, 4), (4, 4)], 256);
 
         let scale = 1.0;
         let ui_px = 13.0;
         let atlas = font::build(&gl, font_bytes, font_px * scale);
         let ui_atlas = font::build(&gl, font_bytes, ui_px * scale);
+        let icon_atlas = icons::build(&gl, icon_bytes, icons::ICON_PX * scale);
 
         unsafe {
             gl.enable(glow::BLEND);
@@ -108,12 +116,15 @@ impl Renderer {
             rects,
             glyphs,
             ui_glyphs,
+            icon_glyphs,
             atlas,
             ui_atlas,
+            icon_atlas,
             width: 1.0,
             height: 1.0,
             scale,
             font_bytes: font_bytes.to_vec(),
+            icon_bytes: icon_bytes.to_vec(),
             font_px,
             ui_px,
             clip: Vec::new(),
@@ -151,9 +162,11 @@ impl Renderer {
         unsafe {
             self.gl.delete_texture(self.atlas.texture);
             self.gl.delete_texture(self.ui_atlas.texture);
+            self.gl.delete_texture(self.icon_atlas.texture);
         }
         self.atlas = font::build(&self.gl, &self.font_bytes, self.font_px * scale);
         self.ui_atlas = font::build(&self.gl, &self.font_bytes, self.ui_px * scale);
+        self.icon_atlas = icons::build(&self.gl, &self.icon_bytes, icons::ICON_PX * scale);
     }
 
     /// Start a frame: set the viewport, clear, and reset the batches.
@@ -177,6 +190,7 @@ impl Renderer {
         self.rects.data.clear();
         self.glyphs.data.clear();
         self.ui_glyphs.data.clear();
+        self.icon_glyphs.data.clear();
     }
 
     /// Set the rounded window mask, in points. Every fragment outside this
@@ -260,18 +274,44 @@ impl Renderer {
         }
     }
 
-    /// Placeholder icon: until the embedded icon font lands (Phase D), draw a
-    /// muted rounded square so layout work can proceed.
+    /// Queue an icon centered in a `size` square whose top-left is `x, y`.
+    /// Icons are tinted by `color`, so one atlas serves every state.
     #[allow(dead_code)] // shell chrome (Phase D)
-    pub fn icon(&mut self, x: f32, y: f32, size: f32, color: Color) {
-        self.rounded_rect(
-            x + size * 0.2,
-            y + size * 0.2,
-            size * 0.6,
-            size * 0.6,
-            1.5,
-            color,
-        );
+    pub fn icon(&mut self, x: f32, y: f32, icon: Icon, size: f32, color: Color) {
+        let Some(g) = self.icon_atlas.get(icon).copied() else {
+            return;
+        };
+        // A shape queued after text must paint over it; same rule as shape().
+        if !self.glyphs.data.is_empty()
+            || !self.ui_glyphs.data.is_empty()
+            || !self.icon_glyphs.data.is_empty()
+        {
+            self.flush_batches();
+        }
+        let s = self.scale;
+        let clip = self.current_clip();
+        // The bitmap was rasterized at ICON_PX points, so scale it to `size`.
+        let k = size / icons::ICON_PX;
+        let dx = (x + (size - g.w * k) * 0.5) * s;
+        let dy = (y + (size - g.h * k) * 0.5) * s;
+        self.icon_glyphs.push(&[
+            dx.round(),
+            dy.round(),
+            (g.w * k * s).round(),
+            (g.h * k * s).round(),
+            g.u0,
+            g.v0,
+            g.u1,
+            g.v1,
+            color[0],
+            color[1],
+            color[2],
+            color[3],
+            clip[0],
+            clip[1],
+            clip[2],
+            clip[3],
+        ]);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -282,7 +322,10 @@ impl Renderer {
         // A shape queued after text must paint over it. Flush *both* batches:
         // rects are only uploaded at flush time, so flushing the glyphs alone
         // would let an earlier background rect land on top of the text.
-        if !self.glyphs.data.is_empty() || !self.ui_glyphs.data.is_empty() {
+        if !self.glyphs.data.is_empty()
+            || !self.ui_glyphs.data.is_empty()
+            || !self.icon_glyphs.data.is_empty()
+        {
             self.flush_batches();
         }
         let s = self.scale;
@@ -377,7 +420,10 @@ impl Renderer {
     }
 
     fn flush_text(&mut self) {
-        if self.glyphs.data.is_empty() && self.ui_glyphs.data.is_empty() {
+        if self.glyphs.data.is_empty()
+            && self.ui_glyphs.data.is_empty()
+            && self.icon_glyphs.data.is_empty()
+        {
             return;
         }
         unsafe {
@@ -396,6 +442,11 @@ impl Renderer {
                 self.gl
                     .bind_texture(glow::TEXTURE_2D, Some(self.ui_atlas.texture));
                 self.ui_glyphs.draw(&self.gl);
+            }
+            if !self.icon_glyphs.data.is_empty() {
+                self.gl
+                    .bind_texture(glow::TEXTURE_2D, Some(self.icon_atlas.texture));
+                self.icon_glyphs.draw(&self.gl);
             }
             self.gl.bind_texture(glow::TEXTURE_2D, None);
         }
