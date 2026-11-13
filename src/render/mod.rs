@@ -825,3 +825,31 @@ fn queue_text(
         col += 1;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn boxes_that_only_touch_do_not_intersect() {
+        // Sharing an edge is not covering: a row hairline directly above a
+        // label must not count as painting over it (issue #4).
+        let a = [0.0, 0.0, 10.0, 10.0];
+        assert!(intersects(a, [5.0, 5.0, 10.0, 10.0]), "real overlap");
+        assert!(!intersects(a, [10.0, 0.0, 10.0, 10.0]), "touching x");
+        assert!(!intersects(a, [0.0, 10.0, 10.0, 10.0]), "touching y");
+        assert!(!intersects(a, [20.0, 20.0, 5.0, 5.0]), "far away");
+    }
+
+    #[test]
+    fn a_wash_is_recognised_by_its_shape() {
+        // Row highlights are wide and about one row tall, with full alpha.
+        assert!(is_wash_shaped(240.0, 28.0));
+        assert!(is_wash_shaped(120.0, 24.0));
+        // A hairline is not a wash, a big panel is not a wash, and neither is
+        // a tall narrow strip.
+        assert!(!is_wash_shaped(600.0, 1.0));
+        assert!(!is_wash_shaped(600.0, 300.0));
+        assert!(!is_wash_shaped(10.0, 20.0));
+    }
+}
