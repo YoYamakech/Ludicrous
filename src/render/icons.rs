@@ -23,6 +23,11 @@ pub enum Icon {
     Close,
     Dot,
     Files,
+    // Diagnostics (v1.2 section 7.3): the status bar and the hover tooltip.
+    CircleX,
+    TriangleAlert,
+    CircleCheck,
+    Info,
 }
 
 impl Icon {
@@ -30,24 +35,28 @@ impl Icon {
     /// is one line here plus one name in the atlas builder.
     pub fn ch(self) -> char {
         let code = match self {
-            Icon::Folder => 0xE0D7,
+            Icon::Folder => 0xE0DB,
             Icon::FolderOpen => 0xE247,
-            Icon::File => 0xE0C0,
-            Icon::ChevronRight => 0xE06F,
-            Icon::ChevronDown => 0xE06D,
-            Icon::Gear => 0xE154,
-            Icon::Sidebar => 0xE12A,
-            Icon::Minimize => 0xE11C,
-            Icon::Maximize => 0xE167,
-            Icon::Restore => 0xE09E,
+            Icon::File => 0xE0C4,
+            Icon::ChevronRight => 0xE073,
+            Icon::ChevronDown => 0xE071,
+            Icon::Gear => 0xE158,
+            Icon::Sidebar => 0xE12E,
+            Icon::Minimize => 0xE120,
+            Icon::Maximize => 0xE16B,
+            Icon::Restore => 0xE0A2,
             Icon::Close => 0xE1B2,
-            Icon::Dot => 0xE076,
-            Icon::Files => 0xE0CF,
+            Icon::Dot => 0xE07A,
+            Icon::Files => 0xE0D3,
+            Icon::CircleX => 0xE088,
+            Icon::TriangleAlert => 0xE193,
+            Icon::CircleCheck => 0xE226,
+            Icon::Info => 0xE0FF,
         };
         char::from_u32(code).unwrap_or(' ')
     }
 
-    pub const ALL: [Icon; 13] = [
+    pub const ALL: [Icon; 17] = [
         Icon::Folder,
         Icon::FolderOpen,
         Icon::File,
@@ -61,6 +70,10 @@ impl Icon {
         Icon::Close,
         Icon::Dot,
         Icon::Files,
+        Icon::CircleX,
+        Icon::TriangleAlert,
+        Icon::CircleCheck,
+        Icon::Info,
     ];
 }
 
@@ -80,8 +93,8 @@ pub struct IconGlyph {
 }
 
 pub struct IconAtlas {
-    /// (codepoint, bitmap) pairs; a linear scan over 13 entries is faster than
-    /// any map.
+    /// (codepoint, bitmap) pairs; a linear scan over a couple of dozen entries
+    /// is faster than any map.
     glyphs: Vec<(char, IconGlyph)>,
     pub texture: glow::Texture,
 }
