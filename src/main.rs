@@ -9,6 +9,7 @@ mod input;
 mod render;
 mod ui;
 mod window;
+mod workspace;
 
 use std::path::PathBuf;
 

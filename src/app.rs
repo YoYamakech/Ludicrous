@@ -18,13 +18,14 @@ use winit::keyboard::ModifiersState;
 use winit::raw_window_handle::HasWindowHandle;
 use winit::window::{CursorIcon, Fullscreen, Window, WindowId};
 
-use crate::editor::{Buffer, Command, Control, Editor};
+use crate::editor::{Command, Control};
 use crate::input;
 use crate::render::Renderer;
 use crate::ui::layout::Layout;
 use crate::ui::theme;
 use crate::ui::view;
 use crate::window::{self, Hit, HitState, ResizeDirection, WindowButton};
+use crate::workspace::{self, Workspace};
 
 // The font is compiled into the binary: no file lookup at startup, no missing
 // font on a fresh machine.
@@ -41,7 +42,7 @@ pub struct App {
     path: Option<PathBuf>,
     window: Option<Window>,
     gl: Option<GlState>,
-    editor: Option<Editor>,
+    workspace: Option<Workspace>,
     mods: ModifiersState,
     /// Created on first use: opening the X11/Wayland clipboard at startup
     /// would slow cold start and can fail on a headless machine.
@@ -63,7 +64,7 @@ impl App {
             path,
             window: None,
             gl: None,
-            editor: None,
+            workspace: None,
             mods: ModifiersState::empty(),
             clipboard: None,
             cursor_pos: None,
@@ -76,7 +77,7 @@ impl App {
     /// Copy the current selection to the system clipboard. Failures become a
     /// status message, never a panic.
     fn copy_selection(&mut self) {
-        let Some(ed) = self.editor.as_mut() else {
+        let Some(ed) = self.workspace.as_mut().and_then(|w| w.active_editor_mut()) else {
             return;
         };
         let Some(text) = ed.selected_text() else {
@@ -101,7 +102,7 @@ impl App {
 
     /// Read the clipboard and hand it to the editor as one paste command.
     fn paste(&mut self) {
-        let Some(ed) = self.editor.as_mut() else {
+        let Some(ed) = self.workspace.as_mut().and_then(|w| w.active_editor_mut()) else {
             return;
         };
         if self.clipboard.is_none() {
@@ -217,17 +218,17 @@ impl App {
 
         // Load the file only now: the window is already on screen, so a slow
         // disk or a huge file does not delay the first paint.
-        let buffer = match self.path.as_deref() {
-            Some(p) => match Buffer::open(p) {
-                Ok(b) => b,
+        let ws = match self.path.as_deref() {
+            Some(p) => match Workspace::open_argument(p) {
+                Ok(ws) => ws,
                 Err(e) => {
-                    eprintln!("ludicrous: could not open {}: {e}", p.display());
-                    Buffer::empty()
+                    eprintln!("ludicrous: {e}");
+                    Workspace::new()
                 }
             },
-            None => Buffer::empty(),
+            None => Workspace::new(),
         };
-        self.editor = Some(Editor::new(buffer));
+        self.workspace = Some(ws);
 
         self.gl = Some(GlState {
             surface,
@@ -262,7 +263,7 @@ impl App {
     fn layout(&self) -> Option<Layout> {
         let window = self.window.as_ref()?;
         let gl = self.gl.as_ref()?;
-        let ed = self.editor.as_ref()?;
+        let ed = self.workspace.as_ref()?.active_editor()?;
         let size = window.inner_size();
         let scale = window.scale_factor() as f32;
         let (w, h) = (size.width as f32 / scale, size.height as f32 / scale);
@@ -277,18 +278,14 @@ impl App {
 
     /// Title text for the title bar.
     fn title(&self) -> String {
-        let Some(ed) = self.editor.as_ref() else {
+        let Some(ws) = self.workspace.as_ref() else {
             return "Ludicrous".to_string();
         };
-        match &ed.buffer.path {
-            Some(p) => {
-                let name = p
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("[No Name]");
-                format!("Ludicrous: {name}")
+        match ws.active_editor() {
+            Some(ed) if ed.path().is_some() => {
+                format!("Ludicrous: {}", workspace::buffer_name(ed))
             }
-            None => "Ludicrous".to_string(),
+            _ => "Ludicrous".to_string(),
         }
     }
 
@@ -369,9 +366,11 @@ impl App {
                 self.sidebar_width(w.inner_size().width as f32 / s)
             })
             .unwrap_or(0.0);
-        let (Some(window), Some(gl), Some(ed)) =
-            (self.window.as_ref(), self.gl.as_mut(), self.editor.as_mut())
-        else {
+        let (Some(window), Some(gl), Some(ed)) = (
+            self.window.as_ref(),
+            self.gl.as_mut(),
+            self.workspace.as_mut().and_then(|w| w.active_editor_mut()),
+        ) else {
             return;
         };
         let size = window.inner_size();
@@ -427,9 +426,10 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
-                // The close button goes through the same guard as Ctrl+Q.
-                let quit = match self.editor.as_mut() {
-                    Some(ed) => ed.request_quit() == Control::Quit,
+                // The close button goes through the same guard as Ctrl+Q, and
+                // every open buffer must be clean before we exit.
+                let quit = match self.workspace.as_mut() {
+                    Some(ws) => ws.request_quit() == Control::Quit,
                     None => true,
                 };
                 if quit {
@@ -470,6 +470,34 @@ impl ApplicationHandler for App {
                     }
                     return;
                 }
+                // Ctrl+Tab / Ctrl+Shift+Tab cycle the open buffers.
+                if self.mods.control_key() {
+                    use winit::keyboard::{Key, NamedKey};
+                    let is_tab = matches!(&event.logical_key, Key::Named(NamedKey::Tab));
+                    let is_w = matches!(&event.logical_key,
+                        Key::Character(c) if c.as_str().eq_ignore_ascii_case("w"));
+                    if is_tab {
+                        if let Some(ws) = self.workspace.as_mut() {
+                            ws.cycle(!self.mods.shift_key());
+                        }
+                        if let Some(w) = self.window.as_ref() {
+                            w.request_redraw();
+                        }
+                        return;
+                    }
+                    if is_w {
+                        if let Some(ws) = self.workspace.as_mut() {
+                            if ws.close_active() == Control::Quit {
+                                event_loop.exit();
+                                return;
+                            }
+                        }
+                        if let Some(w) = self.window.as_ref() {
+                            w.request_redraw();
+                        }
+                        return;
+                    }
+                }
                 // Clipboard commands need the app, not just the editor.
                 if input::is_paste(&event, self.mods) {
                     self.paste();
@@ -485,7 +513,7 @@ impl ApplicationHandler for App {
                 if matches!(cmd, Command::Copy | Command::Cut) {
                     self.copy_selection();
                 }
-                let Some(ed) = self.editor.as_mut() else {
+                let Some(ed) = self.workspace.as_mut().and_then(|w| w.active_editor_mut()) else {
                     return;
                 };
                 if ed.apply(cmd) == Control::Quit {
@@ -532,8 +560,8 @@ impl ApplicationHandler for App {
                     }
                     Hit::Button(WindowButton::Close) => {
                         // Same guard as Ctrl+Q and the OS close request.
-                        let quit = match self.editor.as_mut() {
-                            Some(ed) => ed.request_quit() == Control::Quit,
+                        let quit = match self.workspace.as_mut() {
+                            Some(ws) => ws.request_quit() == Control::Quit,
                             None => true,
                         };
                         if quit {
@@ -546,7 +574,8 @@ impl ApplicationHandler for App {
                         let Some(layout) = self.layout() else {
                             return;
                         };
-                        let Some(ed) = self.editor.as_mut() else {
+                        let Some(ed) = self.workspace.as_mut().and_then(|w| w.active_editor_mut())
+                        else {
                             return;
                         };
                         let scale = self
@@ -604,7 +633,7 @@ impl ApplicationHandler for App {
                         p.y as f32 / cell_h
                     }
                 };
-                let Some(ed) = self.editor.as_mut() else {
+                let Some(ed) = self.workspace.as_mut().and_then(|w| w.active_editor_mut()) else {
                     return;
                 };
                 ed.apply(input::wheel_lines(lines));

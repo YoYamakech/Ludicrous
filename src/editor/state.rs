@@ -143,6 +143,16 @@ impl Editor {
         self.sync_modified();
     }
 
+    /// The open file, if this buffer came from one.
+    pub fn path(&self) -> Option<&std::path::Path> {
+        self.buffer.path.as_deref()
+    }
+
+    /// True when the buffer has never been touched: no file, no text.
+    pub fn is_pristine(&self) -> bool {
+        self.buffer.is_pristine()
+    }
+
     /// True when the text differs from the last saved version.
     pub fn is_dirty(&self) -> bool {
         self.history.is_dirty()

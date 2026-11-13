@@ -109,6 +109,12 @@ impl Buffer {
         }
     }
 
+    /// True when nothing has been typed into this buffer yet: used to decide
+    /// whether an empty unnamed buffer can be replaced when a file is opened.
+    pub fn is_pristine(&self) -> bool {
+        !self.modified && self.rope.len_chars() == 0
+    }
+
     /// Line and column (both 0-based, in characters) of a character index.
     pub fn line_col_of(&self, i: usize) -> (usize, usize) {
         let i = i.min(self.rope.len_chars());
