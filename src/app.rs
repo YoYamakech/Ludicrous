@@ -18,13 +18,16 @@ use winit::keyboard::ModifiersState;
 use winit::raw_window_handle::HasWindowHandle;
 use winit::window::{CursorIcon, Fullscreen, Window, WindowId};
 
+use crate::config::{Buttons, Config, SidebarMode, WindowState};
 use crate::editor::{Command, Control};
 use crate::input;
 use crate::render::Renderer;
 use crate::ui::focus::Focus;
 use crate::ui::layout::Layout;
+use crate::ui::settings;
 use crate::ui::sidebar::{self, SidebarState};
 use crate::ui::theme;
+use crate::ui::theme::Palette;
 use crate::ui::view;
 use crate::window::{self, Hit, HitState, ResizeDirection, WindowButton};
 use crate::workspace::{self, Workspace};
@@ -33,7 +36,6 @@ use crate::workspace::{self, Workspace};
 // font on a fresh machine.
 const FONT: &[u8] = include_bytes!("../assets/font.ttf");
 const ICONS: &[u8] = include_bytes!("../assets/icons.ttf");
-const FONT_PX: f32 = 15.0;
 
 struct GlState {
     surface: Surface<WindowSurface>,
@@ -66,6 +68,20 @@ pub struct App {
     /// True when the GL config actually has an alpha channel. Without it the
     /// window is opaque and square, and we say so once at startup.
     transparent: bool,
+    /// User settings, loaded before the window exists and saved on change.
+    config: Config,
+    /// True while the settings page replaces the text area.
+    settings_open: bool,
+    /// Selected settings row, for keyboard navigation.
+    settings_row: usize,
+    /// Settings row under the mouse (for the hover wash).
+    settings_hover: Option<usize>,
+    /// Window geometry to restore at startup and write back on exit.
+    state: WindowState,
+    /// Cursor blink phase (only used when `config.cursor_blink` is on).
+    blink_on: bool,
+    /// When the blink phase flips next.
+    blink_at: std::time::Instant,
 }
 
 impl App {
@@ -84,6 +100,84 @@ impl App {
             focus: Focus::default(),
             sidebar: SidebarState::default(),
             transparent: false,
+            config: Config::default(),
+            settings_open: false,
+            settings_row: 0,
+            settings_hover: None,
+            state: WindowState::default(),
+            blink_on: true,
+            blink_at: std::time::Instant::now(),
+        }
+    }
+
+    /// Read the config and the remembered window geometry. Called before the
+    /// window is created, as the spec asks (the file is tiny).
+    pub fn load_settings(&mut self) {
+        self.config = Config::load();
+        self.state = WindowState::load();
+    }
+
+    /// Push config values into the renderer/window after a live change: font
+    /// sizes (which rebuild the atlases) and the window radius.
+    fn apply_config(&mut self, old: &Config) {
+        let font_changed = old.font_size != self.config.font_size;
+        if let Some(gl) = self.gl.as_mut() {
+            if font_changed {
+                gl.renderer.set_font_size(self.config.font_size as f32);
+            }
+        }
+        // Saving is deliberate: only when a value actually changed.
+        if old != &self.config {
+            self.config.save();
+            if let Some(w) = self.window.as_ref() {
+                w.request_redraw();
+            }
+        }
+    }
+
+    /// Change one setting from the UI, save it, and redraw. Returns true when
+    /// the config actually changed.
+    fn change_config(&mut self, f: impl FnOnce(&mut Config) -> bool) -> bool {
+        let old = self.config.clone();
+        let changed = f(&mut self.config);
+        if changed {
+            self.apply_config(&old);
+            // Some settings affect window-level state immediately.
+            if old.sidebar != self.config.sidebar {
+                self.sidebar_manual = match self.config.sidebar {
+                    SidebarMode::Auto => None,
+                    SidebarMode::Expanded => Some(true),
+                    SidebarMode::Rail | SidebarMode::Hidden => Some(false),
+                };
+            }
+            if let Some(w) = self.window.as_ref() {
+                w.request_redraw();
+            }
+        }
+        changed
+    }
+
+    /// Remember the window size and maximized flag, then leave.
+    fn remember_state(&mut self) {
+        if let Some(w) = self.window.as_ref() {
+            let size = w.inner_size();
+            let scale = w.scale_factor() as f32;
+            self.state.width = size.width as f32 / scale;
+            self.state.height = size.height as f32 / scale;
+            self.state.maximized = w.is_maximized();
+        }
+        self.state.save();
+    }
+
+    fn toggle_settings(&mut self) {
+        self.settings_open = !self.settings_open;
+        self.focus = if self.settings_open {
+            Focus::Settings
+        } else {
+            Focus::Editor
+        };
+        if let Some(w) = self.window.as_ref() {
+            w.request_redraw();
         }
     }
 
@@ -150,7 +244,7 @@ impl App {
         // shape does not cover it.
         let attributes = Window::default_attributes()
             .with_title("Ludicrous")
-            .with_inner_size(LogicalSize::new(1000.0, 660.0))
+            .with_inner_size(LogicalSize::new(self.state.width, self.state.height))
             .with_min_inner_size(LogicalSize::new(theme::MIN_W, theme::MIN_H))
             .with_decorations(false)
             .with_transparent(true);
@@ -226,7 +320,7 @@ impl App {
             })
         };
 
-        let mut renderer = Renderer::new(gl, FONT, ICONS, FONT_PX);
+        let mut renderer = Renderer::new(gl, FONT, ICONS, self.config.font_size as f32);
         renderer.set_scale(window.scale_factor() as f32);
 
         // Load the file only now: the window is already on screen, so a slow
@@ -248,6 +342,11 @@ impl App {
             context,
             renderer,
         });
+        // Restore the remembered maximized state. Position is never restored:
+        // Wayland does not allow it.
+        if self.state.maximized {
+            window.set_maximized(true);
+        }
         self.window = Some(window);
         Ok(())
     }
@@ -258,6 +357,13 @@ impl App {
     /// manual Ctrl+B toggle wins until the window is resized across one of
     /// those thresholds (see `on_resize`).
     fn sidebar_width(&self, w: f32) -> f32 {
+        // The configured mode wins; `Auto` falls back to the width thresholds.
+        match self.config.sidebar {
+            SidebarMode::Expanded => return theme::SIDEBAR_W,
+            SidebarMode::Rail => return theme::SIDEBAR_RAIL_W,
+            SidebarMode::Hidden => return 0.0,
+            SidebarMode::Auto => {}
+        }
         let expanded = match self.sidebar_manual {
             Some(show) => show,
             None => w >= 900.0,
@@ -316,7 +422,7 @@ impl App {
         HitState {
             maximized,
             fullscreen,
-            buttons_left: false,
+            buttons_left: self.config.window_buttons == Buttons::Left,
         }
     }
 
@@ -364,7 +470,107 @@ impl App {
             })
             .unwrap_or(1000.0);
         let expanded = self.sidebar_width(w) >= theme::SIDEBAR_W;
-        self.sidebar_manual = Some(!expanded);
+        let rail = self.sidebar_width(w) >= theme::SIDEBAR_RAIL_W && !expanded;
+        // Expanded <-> hidden; a rail-mode sidebar toggles its rail instead.
+        self.sidebar_manual = Some(if rail { expanded } else { !expanded });
+    }
+
+    /// Keyboard handling for the settings page. Returns true when the key was
+    /// consumed.
+    fn settings_key(&mut self, event: &winit::event::KeyEvent) -> bool {
+        use winit::keyboard::{Key, NamedKey};
+        match event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                self.settings_open = false;
+                self.focus = Focus::Editor;
+                self.settings_hover = None;
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                self.settings_row = (self.settings_row + 1).min(settings::Row::COUNT - 1);
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                self.settings_row = self.settings_row.saturating_sub(1);
+            }
+            Key::Named(NamedKey::ArrowRight) | Key::Named(NamedKey::Enter) => {
+                let row = settings::Row::from_index(self.settings_row);
+                self.change_config(|c| settings::step(c, row, 1));
+            }
+            Key::Named(NamedKey::ArrowLeft) => {
+                let row = settings::Row::from_index(self.settings_row);
+                self.change_config(|c| settings::step(c, row, -1));
+            }
+            Key::Named(NamedKey::Tab) => {
+                self.settings_row = (self.settings_row + 1) % settings::Row::COUNT;
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// The settings layout for the current window, or None.
+    fn settings_geometry(&self) -> Option<Layout> {
+        self.layout()
+    }
+
+    /// Settings row under the mouse.
+    fn settings_row_at_cursor(&self) -> Option<usize> {
+        let pos = self.cursor_pos?;
+        let window = self.window.as_ref()?;
+        let scale = window.scale_factor() as f32;
+        let (x, y) = window::to_points(pos, scale);
+        let l = self.settings_geometry()?;
+        settings::Geometry::new(&l).hit(x, y).map(|(row, _)| row)
+    }
+
+    /// Handle a click while the settings page is open. Returns true when the
+    /// click landed on the page (and was consumed).
+    fn settings_click(&mut self) -> bool {
+        let Some(pos) = self.cursor_pos else {
+            return false;
+        };
+        let Some(window) = self.window.as_ref() else {
+            return false;
+        };
+        let scale = window.scale_factor() as f32;
+        let (x, y) = window::to_points(pos, scale);
+        let Some(l) = self.settings_geometry() else {
+            return false;
+        };
+        // Only clicks inside the page's panel are consumed; the sidebar and
+        // title bar stay usable.
+        if x < l.sidebar_w {
+            return false;
+        }
+        let Some((row, changed)) = settings::click(&mut self.config, &l, x, y) else {
+            // Blank space below the rows: leave the page open but unfocus.
+            return true;
+        };
+        self.settings_row = row;
+        self.focus = Focus::Settings;
+        if changed {
+            let old = self.config.clone();
+            // `click` already mutated the config, so persist and rebuild.
+            let _ = &old;
+            self.config.save();
+            self.apply_after_settings_change();
+        }
+        true
+    }
+
+    /// Rebuild anything that depends on a setting after the settings page
+    /// changed it (the config has already been mutated and saved).
+    fn apply_after_settings_change(&mut self) {
+        if let Some(gl) = self.gl.as_mut() {
+            gl.renderer.set_font_size(self.config.font_size as f32);
+        }
+        self.sidebar_manual = match self.config.sidebar {
+            SidebarMode::Auto => None,
+            SidebarMode::Expanded => Some(true),
+            SidebarMode::Rail | SidebarMode::Hidden => Some(false),
+        };
+        if let Some(w) = self.window.as_ref() {
+            w.request_redraw();
+        }
     }
 
     /// Sidebar width in points, or 0 when it is hidden.
@@ -585,21 +791,47 @@ impl App {
             .active_editor()
             .map(|e| e.buffer.line_count())
             .unwrap_or(1);
-        let layout = Layout::new(r, line_count, w, h, sidebar_w);
+        let layout = Layout::with_numbers(
+            r,
+            line_count,
+            w,
+            h,
+            sidebar_w,
+            self.config.show_line_numbers,
+        );
         let (rows, cols) = (layout.rows, layout.cols);
         if let Some(ed) = ws.active_editor_mut() {
             ed.ensure_visible(rows, cols);
         }
         let modified = ws.active_editor().map(|e| e.is_dirty()).unwrap_or(false);
+        let palette = Palette::of(self.config.theme);
         let chrome = view::Chrome {
             title: &title,
             modified,
             maximized: window.is_maximized(),
             hover,
             focus: self.focus,
+            caret: self.blink_on || !self.config.cursor_blink,
             sidebar: self.sidebar.clone(),
+            palette,
+            settings: self.settings_open,
+            radius: self.config.corner_radius as f32,
+            buttons_left: self.config.window_buttons == Buttons::Left,
         };
         view::draw(r, ws, &layout, &chrome);
+        // The settings page replaces the text area, over the editor layer.
+        if self.settings_open {
+            r.layer(crate::render::Layer::Overlay);
+            r.rect(layout.sidebar_w, 0.0, w - layout.sidebar_w, h, palette.bg);
+            settings::draw(
+                r,
+                &layout,
+                &palette,
+                &self.config,
+                self.settings_row,
+                self.settings_hover,
+            );
+        }
 
         r.flush();
         let _ = gl.surface.swap_buffers(&gl.context);
@@ -633,6 +865,25 @@ impl ApplicationHandler for App {
         }
     }
 
+    /// Blink the caret without ever busy-waiting: when blinking is on we ask
+    /// for a wake-up at the next flip, otherwise we sleep until input.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if !self.config.cursor_blink {
+            self.blink_on = true;
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
+        let now = std::time::Instant::now();
+        if now >= self.blink_at {
+            self.blink_on = !self.blink_on;
+            self.blink_at = now + std::time::Duration::from_millis(530);
+            if let Some(w) = self.window.as_ref() {
+                w.request_redraw();
+            }
+        }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(self.blink_at));
+    }
+
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
@@ -643,6 +894,7 @@ impl ApplicationHandler for App {
                     None => true,
                 };
                 if quit {
+                    self.remember_state();
                     event_loop.exit();
                 } else if let Some(w) = self.window.as_ref() {
                     w.request_redraw();
@@ -653,6 +905,29 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state != ElementState::Pressed {
                     return;
+                }
+                // Ctrl+, opens or closes the settings page.
+                if self.mods.control_key()
+                    && matches!(&event.logical_key,
+                        winit::keyboard::Key::Character(c) if c.as_str() == ",")
+                {
+                    self.toggle_settings();
+                    return;
+                }
+                // While the settings page is open it owns the keyboard: it
+                // replaces the text area, so the editor must not see these.
+                if self.settings_open {
+                    if self.settings_key(&event) {
+                        if let Some(w) = self.window.as_ref() {
+                            w.request_redraw();
+                        }
+                        return;
+                    }
+                    // Control shortcuts (save, quit, tab cycling) still pass
+                    // through below; plain keys are swallowed by the page.
+                    if !self.mods.control_key() {
+                        return;
+                    }
                 }
                 // Ctrl+Shift+E focuses the file tree (wherever focus was).
                 if self.mods.control_key()
@@ -726,10 +1001,9 @@ impl ApplicationHandler for App {
                     }
                     if is_w {
                         if let Some(ws) = self.workspace.as_mut() {
-                            if ws.close_active() == Control::Quit {
-                                event_loop.exit();
-                                return;
-                            }
+                            // close_active only returns Quit for the guard on a
+                            // dirty buffer; closing never exits the window.
+                            let _ = ws.close_active();
                         }
                         if let Some(w) = self.window.as_ref() {
                             w.request_redraw();
@@ -756,6 +1030,7 @@ impl ApplicationHandler for App {
                         None => true,
                     };
                     if quit {
+                        self.remember_state();
                         event_loop.exit();
                     } else if let Some(w) = self.window.as_ref() {
                         w.request_redraw();
@@ -770,6 +1045,7 @@ impl ApplicationHandler for App {
                     return;
                 };
                 if ed.apply(cmd) == Control::Quit {
+                    self.remember_state();
                     event_loop.exit();
                     return;
                 }
@@ -780,6 +1056,17 @@ impl ApplicationHandler for App {
             WindowEvent::MouseInput { state, button, .. } => {
                 if state != ElementState::Pressed || button != MouseButton::Left {
                     return;
+                }
+                // The settings page sits over the editing area; a click there
+                // never reaches the editor or the sidebar.
+                if self.settings_open {
+                    let handled = self.settings_click();
+                    if handled {
+                        if let Some(w) = self.window.as_ref() {
+                            w.request_redraw();
+                        }
+                        return;
+                    }
                 }
                 match self.sidebar_hit() {
                     Some(sidebar::Hit::Empty) => {}
@@ -802,9 +1089,9 @@ impl ApplicationHandler for App {
                                 self.focus = Focus::Sidebar;
                             }
                             sidebar::Hit::RailSettings | sidebar::Hit::Settings => {
-                                // The settings page arrives in Phase E; until
-                                // then the row is a plain focus target.
-                                self.focus = Focus::Editor;
+                                // The sidebar footer opens the settings page,
+                                // exactly like Ctrl+, does.
+                                self.toggle_settings();
                             }
                             sidebar::Hit::Header | sidebar::Hit::Empty => {
                                 self.focus = Focus::Editor;
@@ -854,6 +1141,7 @@ impl ApplicationHandler for App {
                             None => true,
                         };
                         if quit {
+                            self.remember_state();
                             event_loop.exit();
                         } else if let Some(w) = self.window.as_ref() {
                             w.request_redraw();
@@ -894,6 +1182,15 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = Some(position);
                 let sidebar_changed = self.update_sidebar_hover();
+                if self.settings_open {
+                    let row = self.settings_row_at_cursor();
+                    if row != self.settings_hover {
+                        self.settings_hover = row;
+                        if let Some(w) = self.window.as_ref() {
+                            w.request_redraw();
+                        }
+                    }
+                }
                 // Hover feedback: only redraw when the target actually changes.
                 let hit = self.hit_at_cursor();
                 if sidebar_changed {
@@ -918,6 +1215,9 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                if self.settings_open {
+                    return; // the page fits; nothing to scroll
+                }
                 // Over the file tree the wheel scrolls the tree, not the text.
                 if matches!(
                     self.sidebar_hit(),
@@ -970,6 +1270,13 @@ impl ApplicationHandler for App {
                     .map(|w| w.scale_factor() as f32)
                     .unwrap_or(1.0);
                 let w_pts = size.width as f32 / scale;
+                self.state.width = w_pts;
+                self.state.height = size.height as f32 / scale;
+                self.state.maximized = self
+                    .window
+                    .as_ref()
+                    .map(|w| w.is_maximized())
+                    .unwrap_or(false);
                 // A manual Ctrl+B choice lasts only until the window is
                 // resized across one of the auto-collapse breakpoints.
                 let mode = Self::auto_sidebar_mode(w_pts);

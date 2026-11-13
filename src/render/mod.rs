@@ -152,6 +152,25 @@ impl Renderer {
         )
     }
 
+    /// Change the editor/UI font size live (the settings stepper). Rebuilds the
+    /// text atlas at the new size; the icon atlas does not depend on it.
+    pub fn set_font_size(&mut self, px: f32) {
+        if (px - self.font_px).abs() < 0.01 {
+            return;
+        }
+        self.font_px = px;
+        // The UI atlas follows the editor size at a fixed offset, the way the
+        // spec's "smaller UI size" reads.
+        self.ui_px = (px - 2.0).max(9.0);
+        unsafe {
+            self.gl.delete_texture(self.atlas.texture);
+            self.gl.delete_texture(self.ui_atlas.texture);
+        }
+        let scale = self.scale;
+        self.atlas = font::build(&self.gl, &self.font_bytes, self.font_px * scale);
+        self.ui_atlas = font::build(&self.gl, &self.font_bytes, self.ui_px * scale);
+    }
+
     /// Update the HiDPI factor. Re-rasterizes the atlases at the new density so
     /// glyphs stay sharp when the window moves to a different monitor.
     pub fn set_scale(&mut self, scale: f32) {

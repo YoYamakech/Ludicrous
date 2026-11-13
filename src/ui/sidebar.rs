@@ -8,6 +8,7 @@ use crate::render::{Color, Icon, Renderer};
 use crate::ui::focus::Focus;
 use crate::ui::layout::Layout;
 use crate::ui::theme;
+use crate::ui::theme::Palette;
 use crate::workspace::Workspace;
 
 /// Height of the app-mark header at the top of the sidebar.
@@ -173,13 +174,14 @@ pub fn draw(
     geo: &Geometry,
     state: &SidebarState,
     focus: Focus,
+    p: &Palette,
 ) {
     let w = l.sidebar_w;
-    r.rect(0.0, geo.top, w, geo.height, theme::SIDEBAR_BG);
-    r.rect(w - 1.0, geo.top, 1.0, geo.height, theme::BORDER);
+    r.rect(0.0, geo.top, w, geo.height, p.sidebar_bg);
+    r.rect(w - 1.0, geo.top, 1.0, geo.height, p.border);
 
     if geo.rail {
-        draw_rail(r, geo, state);
+        draw_rail(r, geo, state, p);
         return;
     }
 
@@ -195,37 +197,33 @@ pub fn draw(
         mark,
         mark,
         3.0,
-        theme::ACCENT,
+        p.accent,
     );
     let name = crate::workspace::root_name(&ws.root).unwrap_or_else(|| "Ludicrous".to_string());
     let tx = pad + mark + 8.0;
     let name = truncate(r, &name, w - tx - pad);
-    r.text_ui(tx, geo.top + (HEADER_H - 13.0) * 0.5, &name, theme::TEXT);
-    r.rect(0.0, geo.top + HEADER_H, w, 1.0, theme::BORDER);
+    r.text_ui(tx, geo.top + (HEADER_H - 13.0) * 0.5, &name, p.text);
+    r.rect(0.0, geo.top + HEADER_H, w, 1.0, p.border);
 
-    r.text_ui(pad, geo.top + HEADER_H + 4.0, "OPEN FILES", theme::MUTED);
+    r.text_ui(pad, geo.top + HEADER_H + 4.0, "OPEN FILES", p.muted);
 
     // OPEN FILES list: one pill row per buffer, active and hover states.
     let labels = ws.file_labels();
     for (i, (label, dirty)) in labels.iter().take(geo.open_visible).enumerate() {
         let y = geo.open_y + i as f32 * theme::ROW_H;
         if i == ws.active {
-            pill(r, inner_x, y, inner_w, theme::PILL_ACTIVE);
+            pill(r, inner_x, y, inner_w, p.pill_active);
         } else if state.hover_open == Some(i) {
-            pill(r, inner_x, y, inner_w, theme::PILL_HOVER);
+            pill(r, inner_x, y, inner_w, p.pill_hover);
         }
         r.icon(
             pad + 2.0,
             y + (theme::ROW_H - 14.0) * 0.5,
             Icon::File,
             14.0,
-            theme::MUTED,
+            p.muted,
         );
-        let color = if i == ws.active {
-            theme::TEXT
-        } else {
-            theme::MUTED
-        };
+        let color = if i == ws.active { p.text } else { p.muted };
         let label = truncate(r, label, w - pad - 44.0);
         r.text_ui(pad + 22.0, y + 7.0, &label, color);
         if *dirty {
@@ -236,15 +234,15 @@ pub fn draw(
                 dot,
                 dot,
                 dot * 0.5,
-                theme::ACCENT,
+                p.accent,
             );
         }
     }
 
     // Divider and the FILES label.
     let div_y = geo.open_y + geo.open_visible as f32 * theme::ROW_H + pad * 0.5;
-    r.rect(pad, div_y, w - pad * 2.0, 1.0, theme::BORDER);
-    r.text_ui(pad, div_y + pad * 0.5 + 4.0, "FILES", theme::MUTED);
+    r.rect(pad, div_y, w - pad * 2.0, 1.0, p.border);
+    r.text_ui(pad, div_y + pad * 0.5 + 4.0, "FILES", p.muted);
 
     // File tree: clipped to its viewport, scrolled by whole rows, and only the
     // visible rows are drawn (same rule as the text area).
@@ -258,16 +256,16 @@ pub fn draw(
             continue;
         }
         if n == state.selected && focus == Focus::Sidebar {
-            pill(r, inner_x, y, inner_w, theme::PILL_ACTIVE);
+            pill(r, inner_x, y, inner_w, p.pill_active);
         } else if state.hover_tree == Some(n) {
-            pill(r, inner_x, y, inner_w, theme::PILL_HOVER);
+            pill(r, inner_x, y, inner_w, p.pill_hover);
         }
 
         let indent = pad + 2.0 + row.depth as f32 * 14.0;
         if row.unreadable || row.more > 0 {
             // Synthetic rows ("(unreadable)", "… N more"): muted, no chevron.
             let name = truncate(r, &row.name, w - indent - pad);
-            r.text_ui(indent, y + 7.0, &name, theme::MUTED);
+            r.text_ui(indent, y + 7.0, &name, p.muted);
             continue;
         }
         if row.is_dir {
@@ -276,7 +274,7 @@ pub fn draw(
             } else {
                 Icon::ChevronRight
             };
-            r.icon(indent, y + 7.0, chevron, 12.0, theme::MUTED);
+            r.icon(indent, y + 7.0, chevron, 12.0, p.muted);
         }
         let icon = match (row.is_dir, row.expanded) {
             (true, true) => Icon::FolderOpen,
@@ -284,13 +282,9 @@ pub fn draw(
             (false, _) => Icon::File,
         };
         let icon_x = indent + 14.0;
-        r.icon(icon_x, y + 7.0, icon, 14.0, theme::MUTED);
+        r.icon(icon_x, y + 7.0, icon, 14.0, p.muted);
         let tx = icon_x + 20.0;
-        let color = if row.is_dir {
-            theme::TEXT
-        } else {
-            theme::STATUS_TEXT
-        };
+        let color = if row.is_dir { p.text } else { p.status_text };
         let name = truncate(r, &row.name, w - tx - pad);
         r.text_ui(tx, y + 7.0, &name, color);
     }
@@ -298,16 +292,16 @@ pub fn draw(
 
     // Footer: Settings row.
     if state.hover_icon == Some(0) {
-        pill(r, inner_x, geo.footer_y, inner_w, theme::PILL_HOVER);
+        pill(r, inner_x, geo.footer_y, inner_w, p.pill_hover);
     }
     r.icon(
         pad + 2.0,
         geo.footer_y + (FOOTER_H - 14.0) * 0.5,
         Icon::Gear,
         14.0,
-        theme::MUTED,
+        p.muted,
     );
-    r.text_ui(pad + 22.0, geo.footer_y + 7.0, "Settings", theme::MUTED);
+    r.text_ui(pad + 22.0, geo.footer_y + 7.0, "Settings", p.muted);
 
     // Project card: folder name over the (clipped) path.
     let card_y = geo.card_y;
@@ -317,20 +311,20 @@ pub fn draw(
         inner_w,
         CARD_H,
         theme::PILL_RADIUS,
-        theme::PILL_ACTIVE,
+        p.pill_active,
     );
     let short = truncate(r, &name, inner_w - 16.0);
-    r.text_ui(pad + 8.0, card_y + 7.0, &short, theme::TEXT);
+    r.text_ui(pad + 8.0, card_y + 7.0, &short, p.text);
     let path = ws
         .root
         .as_ref()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "no folder open".to_string());
     let path = truncate(r, &path, inner_w - 16.0);
-    r.text_ui(pad + 8.0, card_y + 25.0, &path, theme::MUTED);
+    r.text_ui(pad + 8.0, card_y + 25.0, &path, p.muted);
 }
 
-fn draw_rail(r: &mut Renderer, geo: &Geometry, state: &SidebarState) {
+fn draw_rail(r: &mut Renderer, geo: &Geometry, state: &SidebarState, p: &Palette) {
     let w = geo.sidebar_w;
     let first = geo.top + theme::PAD;
     for (i, icon) in [Icon::Files, Icon::Gear].into_iter().enumerate() {
@@ -342,7 +336,7 @@ fn draw_rail(r: &mut Renderer, geo: &Geometry, state: &SidebarState) {
                 w - theme::PAD,
                 RAIL_SLOT - 8.0,
                 theme::PILL_RADIUS,
-                theme::PILL_HOVER,
+                p.pill_hover,
             );
         }
         let size = 18.0;
@@ -351,7 +345,7 @@ fn draw_rail(r: &mut Renderer, geo: &Geometry, state: &SidebarState) {
             y + (RAIL_SLOT - size) * 0.5,
             icon,
             size,
-            theme::MUTED,
+            p.muted,
         );
     }
 }

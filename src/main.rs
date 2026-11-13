@@ -4,6 +4,7 @@
 // Everything else lives in a module with one clear job (see app.rs / editor/ / ui/ / render/).
 
 mod app;
+mod config;
 mod editor;
 mod input;
 mod render;
@@ -25,6 +26,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     event_loop.set_control_flow(ControlFlow::Wait);
 
     let mut app = app::App::new(path);
+    // Read `config` and `state` before the window exists: the window size and
+    // font come from them. A broken file falls back to defaults, never fails.
+    app.load_settings();
     event_loop.run_app(&mut app)?;
     Ok(())
 }

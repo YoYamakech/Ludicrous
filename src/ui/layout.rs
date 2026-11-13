@@ -16,6 +16,9 @@ pub struct Layout {
     /// Sidebar width in points (0 when hidden).
     pub sidebar_w: f32,
     pub gutter_w: f32,
+    /// False when line numbers are turned off: the gutter disappears and the
+    /// text area gets its width back.
+    pub show_numbers: bool,
     pub text_x: f32,
     pub text_y: f32,
     /// Width of the text area in points (right edge of the window minus the
@@ -34,9 +37,25 @@ const STATUS_LINES: f32 = 1.6; // status bar height in character rows
 
 impl Layout {
     pub fn new(r: &Renderer, line_count: usize, width: f32, height: f32, sidebar_w: f32) -> Self {
+        Self::with_numbers(r, line_count, width, height, sidebar_w, true)
+    }
+
+    /// Same, with the line-number gutter optionally turned off.
+    pub fn with_numbers(
+        r: &Renderer,
+        line_count: usize,
+        width: f32,
+        height: f32,
+        sidebar_w: f32,
+        show_numbers: bool,
+    ) -> Self {
         let (cell_w, cell_h) = r.cell_size();
         let digits = line_count.max(1).to_string().len() as f32;
-        let gutter_w = (digits * cell_w + PAD_X * 2.0).ceil();
+        let gutter_w = if show_numbers {
+            (digits * cell_w + PAD_X * 2.0).ceil()
+        } else {
+            0.0
+        };
         let status_h = (cell_h * STATUS_LINES).ceil();
         let title_h = theme::TITLE_H;
         let text_y = title_h + PAD_Y;
@@ -54,6 +73,7 @@ impl Layout {
             title_h,
             sidebar_w,
             gutter_w,
+            show_numbers,
             text_x,
             text_y,
             text_w,
