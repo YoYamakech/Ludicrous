@@ -19,6 +19,16 @@ use crate::ui::theme::Palette;
 
 /// Everything the panel shows. Built by the app once per frame while open.
 pub struct Info<'a> {
+    /// Startup timings, logged once and shown here (v1.2 section 1).
+    pub window_ms: Option<f32>,
+    pub first_frame_ms: Option<f32>,
+    pub cursor: &'a str,
+    /// Number of real `set_cursor` calls so far, and the size of the hit map.
+    pub cursor_sets: u32,
+    /// The cursor currently set, as `CursorKind::short()`.
+    pub regions: usize,
+    /// True while any animation is still moving (0% idle depends on this).
+    pub animating: bool,
     /// Wall-clock time of the previous frame (input to redraw), in ms.
     pub cpu_ms: f32,
     /// Exact GPU time of the last completed frame, when timer queries work.
@@ -43,7 +53,7 @@ const WIDTH: f32 = 330.0;
 /// Draw the panel in the top-right of the text area. `x`/`y` are the panel's
 /// top-left corner in points; the size is fixed so the text never clips.
 pub fn draw(r: &mut Renderer, p: &Palette, x: f32, y: f32, info: &Info) {
-    let lines = 7;
+    let lines = 9;
     let h = PAD * 2.0 + lines as f32 * LINE_H;
     // A slightly darker plate so the numbers stay readable over text.
     r.rounded_rect(x, y, WIDTH, h, 6.0, p.sidebar_bg);
@@ -72,6 +82,22 @@ pub fn draw(r: &mut Renderer, p: &Palette, x: f32, y: f32, info: &Info) {
     line(r, &format!("batch flushes {}", info.flushes), p.muted);
     line(r, &format!("upload {}", info.upload), p.muted);
     line(r, &format!("paths {}", info.flags), p.muted);
+    let start = match (info.window_ms, info.first_frame_ms) {
+        (Some(w), Some(f)) => format!("startup {w:.0} ms window, {f:.0} ms frame"),
+        _ => "startup measuring".to_string(),
+    };
+    line(r, &start, p.muted);
+    line(
+        r,
+        &format!(
+            "animating {}  cursor {} ({})  regions {}",
+            if info.animating { "yes" } else { "no" },
+            info.cursor,
+            info.cursor_sets,
+            info.regions
+        ),
+        p.muted,
+    );
     line(r, info.gl_version, p.muted);
     line(r, info.gl_renderer, p.muted);
 }

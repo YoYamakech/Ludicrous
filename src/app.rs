@@ -22,7 +22,9 @@ use crate::config::{Buttons, Config, SidebarMode, WindowState};
 use crate::editor::{Command, Control};
 use crate::input;
 use crate::render::Renderer;
+use crate::ui::cursor::{self, CursorKind};
 use crate::ui::focus::Focus;
+use crate::ui::hitmap::{HitMap, Rect, Target};
 use crate::ui::layout::Layout;
 use crate::ui::overlay;
 use crate::ui::settings;
@@ -30,7 +32,7 @@ use crate::ui::sidebar::{self, SidebarState};
 use crate::ui::theme;
 use crate::ui::theme::Palette;
 use crate::ui::view;
-use crate::window::{self, Hit, HitState, ResizeDirection, WindowButton};
+use crate::window::{self, HitState, ResizeDirection, WindowButton};
 use crate::workspace::{self, Workspace};
 
 // The font is compiled into the binary: no file lookup at startup, no missing
@@ -55,8 +57,21 @@ pub struct App {
     clipboard: Option<arboard::Clipboard>,
     /// Last mouse position in physical pixels, for click-to-place-cursor.
     cursor_pos: Option<PhysicalPosition<f64>>,
-    /// What the mouse is over, so hover feedback only redraws on change.
-    hover: Option<Hit>,
+    /// What the mouse is over (from the hit map), so hover feedback only
+    /// redraws on change.
+    hover: Option<Target>,
+    /// Every clickable region for the current layout, front-most last. Clicks,
+    /// hover and the mouse cursor all read this one list.
+    hitmap: HitMap,
+    /// The cursor kind currently set on the window, so `set_cursor` is called
+    /// only when the kind really changes.
+    current_cursor: CursorKind,
+    /// True while files are being dragged over the window. During a drag winit
+    /// sends no pointer position, so nothing is hit-tested and the cursor is
+    /// left to the OS.
+    drop_hover: bool,
+    /// Files dropped since the last drain; one batch, one redraw (Phase 2).
+    pending_drops: Vec<PathBuf>,
     /// Sidebar mode. `None` means "auto" (collapse on narrow windows).
     sidebar_manual: Option<bool>,
     /// Auto sidebar mode last seen, so a resize that crosses a breakpoint can
@@ -88,6 +103,15 @@ pub struct App {
     /// Start of the current redraw, for the CPU frame time shown in the panel.
     frame_started: std::time::Instant,
     last_cpu_ms: f32,
+    /// Process start, for the cold-start numbers (v1.2 section 1). `time to
+    /// window` is when the GL surface first exists, `time to first frame` is
+    /// the first swap. Both are logged once and shown in the F3 overlay.
+    started: std::time::Instant,
+    time_to_window_ms: Option<f32>,
+    time_to_first_frame_ms: Option<f32>,
+    /// How many times `set_cursor` actually reached the window. The spec asks
+    /// for a counter that proves it only runs when the kind changes.
+    cursor_sets: u32,
 }
 
 impl App {
@@ -101,6 +125,10 @@ impl App {
             clipboard: None,
             cursor_pos: None,
             hover: None,
+            hitmap: HitMap::new(),
+            current_cursor: CursorKind::Default,
+            drop_hover: false,
+            pending_drops: Vec::new(),
             sidebar_manual: None,
             auto_mode: 0,
             focus: Focus::default(),
@@ -116,6 +144,23 @@ impl App {
             debug: false,
             frame_started: std::time::Instant::now(),
             last_cpu_ms: 0.0,
+            started: std::time::Instant::now(),
+            time_to_window_ms: None,
+            time_to_first_frame_ms: None,
+            cursor_sets: 0,
+        }
+    }
+
+    /// Record a cold-start milestone once, and log it. Called at most once per
+    /// milestone: later frames must not overwrite the number the spec measures.
+    fn timing(&mut self, first_frame: bool) {
+        let ms = self.started.elapsed().as_secs_f32() * 1000.0;
+        if self.time_to_window_ms.is_none() && !first_frame {
+            self.time_to_window_ms = Some(ms);
+            eprintln!("ludicrous: time to window {ms:.0} ms");
+        } else if self.time_to_first_frame_ms.is_none() && first_frame {
+            self.time_to_first_frame_ms = Some(ms);
+            eprintln!("ludicrous: time to first frame {ms:.0} ms");
         }
     }
 
@@ -401,6 +446,8 @@ impl App {
             window.set_maximized(true);
         }
         self.window = Some(window);
+        // The surface exists and the context is current: window done.
+        self.timing(false);
         Ok(())
     }
 
@@ -479,36 +526,108 @@ impl App {
         }
     }
 
-    /// What is under the last known cursor position, in points.
-    fn hit_at_cursor(&self) -> Option<Hit> {
-        let pos = self.cursor_pos?;
-        let window = self.window.as_ref()?;
-        let scale = window.scale_factor() as f32;
-        let size = window.inner_size();
-        let (w, h) = (size.width as f32 / scale, size.height as f32 / scale);
-        Some(window::hit_test(
-            window::to_points(pos, scale),
-            (w, h),
-            self.hit_state(),
-        ))
-    }
-
-    /// Update the OS cursor icon for the current hover target.
-    fn update_cursor_icon(&self) {
+    /// Rebuild the hit map for the current layout, reusing its allocation.
+    ///
+    /// Called on every mouse event and on every layout change (resize, sidebar
+    /// mode, settings open/closed, tree expand/collapse, scroll), never on
+    /// idle. Order is back to front: background first, chrome and overlays
+    /// last, so the front-most thing wins.
+    fn rebuild_hitmap(&mut self) {
         let Some(window) = self.window.as_ref() else {
             return;
         };
-        let icon = match self.hover {
-            Some(Hit::Resize(dir)) => Some(match dir {
-                ResizeDirection::North | ResizeDirection::South => CursorIcon::NsResize,
-                ResizeDirection::East | ResizeDirection::West => CursorIcon::EwResize,
-                ResizeDirection::NorthEast | ResizeDirection::SouthWest => CursorIcon::NeswResize,
-                ResizeDirection::NorthWest | ResizeDirection::SouthEast => CursorIcon::NwseResize,
-            }),
-            Some(Hit::TitleDrag) => Some(CursorIcon::Default),
-            _ => Some(CursorIcon::Text),
+        let Some(layout) = self.layout() else {
+            return;
         };
-        window.set_cursor(icon.unwrap_or(CursorIcon::Default));
+        let (Some(ws), Some(gl)) = (self.workspace.as_ref(), self.gl.as_ref()) else {
+            return;
+        };
+        let size = window.inner_size();
+        let scale = window.scale_factor() as f32;
+        let (w, h) = (size.width as f32 / scale, size.height as f32 / scale);
+        let _ = gl;
+
+        let mut map = std::mem::take(&mut self.hitmap);
+        map.clear();
+
+        // Base layer: the window background is inert.
+        map.push(Rect::new(0.0, 0.0, w, h), Target::None);
+
+        // Editor: gutter first (inert), then the text area (I-beam).
+        map.push(
+            Rect::new(
+                layout.sidebar_w,
+                layout.text_y,
+                layout.gutter_w,
+                layout.height,
+            ),
+            Target::TextGutter,
+        );
+        map.push(
+            Rect::new(layout.text_x, layout.text_y, layout.text_w, layout.height),
+            Target::TextArea,
+        );
+        map.push(
+            Rect::new(
+                layout.sidebar_w,
+                layout.height - layout.status_h,
+                w - layout.sidebar_w,
+                layout.status_h,
+            ),
+            Target::StatusBar,
+        );
+
+        // Sidebar rows, exactly where they are drawn.
+        if let Some(geo) = self.sidebar_geometry().map(|(_, g)| g) {
+            geo.register(
+                &mut map,
+                ws.file_labels().len(),
+                ws.tree.rows(),
+                self.sidebar.scroll,
+            );
+        }
+
+        // Settings page, over the text area.
+        if self.settings_open {
+            settings::register(&mut map, &layout, &self.config);
+        }
+
+        // Title bar and resize edges, last: the front-most pixels.
+        window::chrome_regions(&mut map, (w, h), self.hit_state());
+
+        self.hitmap = map;
+    }
+
+    /// Set the mouse cursor from one place: the hit map.
+    ///
+    /// Called on mouse move, layout changes under a still pointer, focus gain,
+    /// and after a drag ends. Never while files are being dragged over the
+    /// window (the OS owns the cursor then) and never mid window move/resize.
+    fn refresh_cursor(&mut self) {
+        if self.drop_hover {
+            return;
+        }
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let Some(pos) = self.cursor_pos else {
+            return;
+        };
+        let scale = window.scale_factor() as f32;
+        let kind = cursor::resolve(window::to_points(pos, scale), &self.hitmap);
+        self.set_cursor(kind);
+    }
+
+    /// Apply a cursor kind, but only when it differs from what is on screen.
+    fn set_cursor(&mut self, kind: CursorKind) {
+        if kind == self.current_cursor && !self.drop_hover {
+            return;
+        }
+        self.current_cursor = kind;
+        self.cursor_sets = self.cursor_sets.saturating_add(1);
+        if let Some(window) = self.window.as_ref() {
+            window.set_cursor(cursor_icon(kind));
+        }
     }
 
     /// Toggle the sidebar, remembering the choice until the next resize across
@@ -572,46 +691,41 @@ impl App {
         let scale = window.scale_factor() as f32;
         let (x, y) = window::to_points(pos, scale);
         let l = self.settings_geometry()?;
-        settings::Geometry::new(&l).hit(x, y).map(|(row, _)| row)
+        settings::Geometry::new(&l).row_at(x, y)
     }
 
-    /// Handle a click while the settings page is open. Returns true when the
-    /// click landed on the page (and was consumed).
-    fn settings_click(&mut self) -> bool {
-        let Some(pos) = self.cursor_pos else {
-            return false;
-        };
-        let Some(window) = self.window.as_ref() else {
-            return false;
-        };
-        let scale = window.scale_factor() as f32;
-        let (x, y) = window::to_points(pos, scale);
-        let Some(l) = self.settings_geometry() else {
-            return false;
-        };
-        // Only clicks inside the page's panel are consumed; the sidebar and
-        // title bar stay usable.
-        if x < l.sidebar_w {
-            return false;
-        }
-        let Some((row, changed)) = settings::click(&mut self.config, &l, x, y) else {
-            // Blank space below the rows: leave the page open but unfocus.
-            return true;
-        };
-        self.settings_row = row;
-        self.focus = Focus::Settings;
+    /// Apply one click on a settings control piece. Returns true when the row
+    /// under the pointer changed (so the hover wash can follow).
+    fn settings_click_part(&mut self, row: usize, part: Option<usize>) -> bool {
+        let setting = settings::Row::from_index(row);
+        let before = self.config.clone();
+        let changed = settings::apply_part(&mut self.config, setting, part);
         if changed {
-            let old = self.config.clone();
-            // `click` already mutated the config, so persist and rebuild.
-            let _ = &old;
             self.config.save();
             self.apply_after_settings_change();
         }
+        let _ = before;
         true
     }
 
     /// Rebuild anything that depends on a setting after the settings page
     /// changed it (the config has already been mutated and saved).
+    /// The layout changed under a still pointer (sidebar mode, settings page,
+    /// tree, scroll, resize): the map and the cursor must follow at once.
+    fn layout_changed(&mut self) {
+        self.update_pointer();
+        if let Some(w) = self.window.as_ref() {
+            w.request_redraw();
+        }
+    }
+
+    /// A short-lived status message in the editor's status bar.
+    fn status_hint(&mut self, msg: &str) {
+        if let Some(ed) = self.workspace.as_mut().and_then(|w| w.active_editor_mut()) {
+            ed.status = Some(msg.to_string());
+        }
+    }
+
     fn apply_after_settings_change(&mut self) {
         if let Some(gl) = self.gl.as_mut() {
             gl.renderer.set_font_size(self.config.font_size as f32);
@@ -652,44 +766,48 @@ impl App {
         Some((l, geo))
     }
 
-    /// What the mouse is over inside the sidebar.
-    fn sidebar_hit(&self) -> Option<sidebar::Hit> {
-        let pos = self.cursor_pos?;
-        let window = self.window.as_ref()?;
-        let scale = window.scale_factor() as f32;
-        let (x, y) = window::to_points(pos, scale);
-        let (_l, geo) = self.sidebar_geometry()?;
-        let ws = self.workspace.as_ref()?;
-        Some(geo.hit(
-            x,
-            y,
-            ws.file_labels().len(),
-            ws.tree.rows().len(),
-            self.sidebar.scroll,
-        ))
-    }
+    /// Recompute everything that depends on where the pointer is.
+    ///
+    /// One pass: rebuild the map for the current layout, resolve the target,
+    /// update the hover highlights, and set the cursor if its kind changed.
+    /// Returns true when something the user can see changed, so the caller only
+    /// redraws then.
+    fn update_pointer(&mut self) -> bool {
+        self.rebuild_hitmap();
+        let target = match self.cursor_pos {
+            Some(pos) => {
+                let scale = self
+                    .window
+                    .as_ref()
+                    .map(|w| w.scale_factor() as f32)
+                    .unwrap_or(1.0);
+                self.hitmap.target_at(window::to_points(pos, scale))
+            }
+            None => None,
+        };
 
-    /// Refresh the hover flags from the mouse position. Returns true when
-    /// something changed, so the caller only redraws on real changes.
-    fn update_sidebar_hover(&mut self) -> bool {
-        let hit = self.sidebar_hit();
+        // The sidebar keeps its highlights in three plain options; nothing else
+        // in the UI needs per-row hover state.
         let (mut tree, mut open, mut icon) = (None, None, None);
-        match hit {
-            Some(sidebar::Hit::TreeRow(i)) => tree = Some(i),
-            Some(sidebar::Hit::OpenFile(i)) => open = Some(i),
-            Some(sidebar::Hit::Settings) => icon = Some(0),
-            Some(sidebar::Hit::RailFiles) => icon = Some(0),
-            Some(sidebar::Hit::RailSettings) => icon = Some(1),
+        match target {
+            Some(Target::TreeRow(i)) => tree = Some(i),
+            Some(Target::OpenFile(i)) => open = Some(i),
+            Some(Target::SidebarSettings) | Some(Target::RailFiles) => icon = Some(0),
+            Some(Target::RailSettings) => icon = Some(1),
             _ => {}
         }
         let changed = (
             self.sidebar.hover_tree,
             self.sidebar.hover_open,
             self.sidebar.hover_icon,
-        ) != (tree, open, icon);
+            self.hover,
+        ) != (tree, open, icon, target);
         self.sidebar.hover_tree = tree;
         self.sidebar.hover_open = open;
         self.sidebar.hover_icon = icon;
+        self.hover = target;
+
+        self.refresh_cursor();
         changed
     }
 
@@ -904,6 +1022,12 @@ impl App {
             let renderer_string = renderer_string.to_string();
             let flags = path_flags(r.caps);
             let info = overlay::Info {
+                window_ms: self.time_to_window_ms,
+                first_frame_ms: self.time_to_first_frame_ms,
+                cursor_sets: self.cursor_sets,
+                cursor: self.current_cursor.short(),
+                regions: self.hitmap.len(),
+                animating: false,
                 cpu_ms: self.last_cpu_ms,
                 gpu_ms,
                 draw_calls: stats.draw_calls,
@@ -922,6 +1046,7 @@ impl App {
         r.flush();
         let _ = gl.surface.swap_buffers(&gl.context);
         self.last_cpu_ms = self.frame_started.elapsed().as_secs_f32() * 1000.0;
+        self.timing(true);
         // Draw immediately, then wait for the next event.
         event_loop.set_control_flow(ControlFlow::Wait);
     }
@@ -951,6 +1076,24 @@ fn path_flags(caps: crate::render::caps::GlCaps) -> String {
         s.push('-');
     }
     s
+}
+
+/// Map a `CursorKind` to winit's icon. This is the only place `ui/` cursor
+/// decisions meet winit.
+fn cursor_icon(kind: CursorKind) -> CursorIcon {
+    match kind {
+        CursorKind::Default => CursorIcon::Default,
+        CursorKind::Pointer => CursorIcon::Pointer,
+        CursorKind::Text => CursorIcon::Text,
+        CursorKind::ResizeN => CursorIcon::NsResize,
+        CursorKind::ResizeS => CursorIcon::NsResize,
+        CursorKind::ResizeE => CursorIcon::EwResize,
+        CursorKind::ResizeW => CursorIcon::EwResize,
+        CursorKind::ResizeNE => CursorIcon::NeswResize,
+        CursorKind::ResizeSW => CursorIcon::NeswResize,
+        CursorKind::ResizeNW => CursorIcon::NwseResize,
+        CursorKind::ResizeSE => CursorIcon::NwseResize,
+    }
 }
 
 /// winit's resize directions, mapped from our own enum.
@@ -1180,84 +1323,52 @@ impl ApplicationHandler for App {
                 if state != ElementState::Pressed || button != MouseButton::Left {
                     return;
                 }
-                // The settings page sits over the editing area; a click there
-                // never reaches the editor or the sidebar.
-                if self.settings_open {
-                    let handled = self.settings_click();
-                    if handled {
-                        if let Some(w) = self.window.as_ref() {
-                            w.request_redraw();
-                        }
-                        return;
-                    }
+                // A click during a file drag is the drop, handled by the drop
+                // events; never start a window drag from here.
+                if self.drop_hover {
+                    return;
                 }
-                match self.sidebar_hit() {
-                    Some(sidebar::Hit::Empty) => {}
-                    Some(sidebar_hit) => {
-                        match sidebar_hit {
-                            sidebar::Hit::OpenFile(i) => {
-                                if let Some(ws) = self.workspace.as_mut() {
-                                    ws.active = i.min(ws.buffers.len().saturating_sub(1));
-                                }
-                                self.focus = Focus::Editor;
-                            }
-                            sidebar::Hit::TreeRow(i) => {
-                                self.focus = Focus::Sidebar;
-                                self.sidebar.selected = i;
-                                self.activate_tree_row(i);
-                            }
-                            sidebar::Hit::RailFiles => {
-                                // The files icon expands the sidebar.
-                                self.sidebar_manual = Some(true);
-                                self.focus = Focus::Sidebar;
-                            }
-                            sidebar::Hit::RailSettings | sidebar::Hit::Settings => {
-                                // The sidebar footer opens the settings page,
-                                // exactly like Ctrl+, does.
-                                self.toggle_settings();
-                            }
-                            sidebar::Hit::Header | sidebar::Hit::Empty => {
-                                self.focus = Focus::Editor;
-                            }
-                        }
-                        if let Some(w) = self.window.as_ref() {
-                            w.request_redraw();
-                        }
-                        return;
-                    }
-                    None => {}
-                }
-                let Some(hit) = self.hit_at_cursor() else {
+                // One lookup for the whole click: the map already knows what is
+                // under the pointer, including the settings page over the text.
+                self.rebuild_hitmap();
+                let Some(pos) = self.cursor_pos else {
                     return;
                 };
-                match hit {
-                    Hit::Resize(dir) => {
+                let scale = self
+                    .window
+                    .as_ref()
+                    .map(|w| w.scale_factor() as f32)
+                    .unwrap_or(1.0);
+                let target = self.hitmap.target_at(window::to_points(pos, scale));
+
+                match target {
+                    Some(Target::Resize(dir)) => {
                         if let Some(w) = self.window.as_ref() {
                             let _ = w.drag_resize_window(resize_edge(dir));
                         }
                     }
-                    Hit::TitleDrag => {
+                    Some(Target::TitleDrag) => {
+                        // Empty title bar: drag the window. Double-click to
+                        // maximize is handled by the OS-style press count below.
                         if let Some(w) = self.window.as_ref() {
                             let _ = w.drag_window();
                         }
                     }
-                    Hit::SidebarToggle => {
+                    Some(Target::SidebarToggle) => {
                         self.toggle_sidebar();
-                        if let Some(w) = self.window.as_ref() {
-                            w.request_redraw();
-                        }
+                        self.layout_changed();
                     }
-                    Hit::Button(WindowButton::Minimize) => {
+                    Some(Target::Button(WindowButton::Minimize)) => {
                         if let Some(w) = self.window.as_ref() {
                             w.set_minimized(true);
                         }
                     }
-                    Hit::Button(WindowButton::Maximize) => {
+                    Some(Target::Button(WindowButton::Maximize)) => {
                         if let Some(w) = self.window.as_ref() {
                             w.set_maximized(!w.is_maximized());
                         }
                     }
-                    Hit::Button(WindowButton::Close) => {
+                    Some(Target::Button(WindowButton::Close)) => {
                         // Same guard as Ctrl+Q and the OS close request.
                         let quit = match self.workspace.as_mut() {
                             Some(ws) => ws.request_quit() == Control::Quit,
@@ -1270,7 +1381,51 @@ impl ApplicationHandler for App {
                             w.request_redraw();
                         }
                     }
-                    Hit::Content => {
+                    Some(Target::OpenFile(i)) => {
+                        if let Some(ws) = self.workspace.as_mut() {
+                            ws.active = i.min(ws.buffers.len().saturating_sub(1));
+                        }
+                        self.focus = Focus::Editor;
+                        self.layout_changed();
+                    }
+                    Some(Target::TreeRow(i)) => {
+                        self.focus = Focus::Sidebar;
+                        self.sidebar.selected = i;
+                        self.activate_tree_row(i);
+                        self.layout_changed();
+                    }
+                    Some(Target::RailFiles) => {
+                        // The files icon expands the sidebar.
+                        self.sidebar_manual = Some(true);
+                        self.focus = Focus::Sidebar;
+                        self.layout_changed();
+                    }
+                    Some(Target::RailSettings) | Some(Target::SidebarSettings) => {
+                        // The sidebar footer opens the settings page, exactly
+                        // like Ctrl+, does.
+                        self.toggle_settings();
+                        self.layout_changed();
+                    }
+                    Some(Target::ProjectCard) => {
+                        // v1.2 section 5.1 makes the card open a folder; the
+                        // dialog lands in Phase 2. Until then the region still
+                        // exists, so the cursor and hover do not lie.
+                        self.status_hint("Ctrl+Shift+O");
+                        if let Some(w) = self.window.as_ref() {
+                            w.request_redraw();
+                        }
+                    }
+                    Some(Target::SettingsRow { row, part }) => {
+                        self.settings_row = row;
+                        self.focus = Focus::Settings;
+                        if self.settings_click_part(row, part) {
+                            self.settings_hover = Some(row);
+                        }
+                        if let Some(w) = self.window.as_ref() {
+                            w.request_redraw();
+                        }
+                    }
+                    Some(Target::TextArea) => {
                         // Clicking the text area takes keyboard focus back.
                         self.focus = Focus::Editor;
                         let Some(layout) = self.layout() else {
@@ -1280,17 +1435,7 @@ impl ApplicationHandler for App {
                         else {
                             return;
                         };
-                        let scale = self
-                            .window
-                            .as_ref()
-                            .map(|w| w.scale_factor() as f32)
-                            .unwrap_or(1.0);
-                        let Some(pos) = self.cursor_pos else {
-                            return;
-                        };
                         let (x, y) = window::to_points(pos, scale);
-                        // Clicks outside the text area (gutter, status bar) do
-                        // nothing.
                         if let Some((line, col)) =
                             layout.text_position(x, y, ed.scroll, ed.scroll_x)
                         {
@@ -1300,11 +1445,48 @@ impl ApplicationHandler for App {
                             }
                         }
                     }
+                    // Inert regions and empty space: nothing happens, and the
+                    // editor keeps its focus.
+                    Some(Target::None)
+                    | Some(Target::TextGutter)
+                    | Some(Target::StatusBar)
+                    | None => {}
                 }
+            }
+            // External file drag: a window-level state, never hit-tested, because
+            // winit sends no pointer position during a drag (v1.2 section 3).
+            WindowEvent::HoveredFile(_) => {
+                if !self.drop_hover {
+                    self.drop_hover = true;
+                    // Hover and press state from before the drag must not
+                    // survive into it.
+                    self.sidebar.hover_tree = None;
+                    self.sidebar.hover_open = None;
+                    self.sidebar.hover_icon = None;
+                    self.hover = None;
+                    if let Some(w) = self.window.as_ref() {
+                        w.request_redraw();
+                    }
+                }
+            }
+            WindowEvent::HoveredFileCancelled => {
+                if self.drop_hover {
+                    self.drop_hover = false;
+                    self.refresh_cursor();
+                    if let Some(w) = self.window.as_ref() {
+                        w.request_redraw();
+                    }
+                }
+            }
+            WindowEvent::DroppedFile(path) => {
+                // Dropped files arrive one event each; the batch is flushed when
+                // the event queue drains (see `about_to_wait`).
+                self.pending_drops.push(path);
+                self.drop_hover = false;
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = Some(position);
-                let sidebar_changed = self.update_sidebar_hover();
+                let changed = self.update_pointer();
                 if self.settings_open {
                     let row = self.settings_row_at_cursor();
                     if row != self.settings_hover {
@@ -1314,27 +1496,21 @@ impl ApplicationHandler for App {
                         }
                     }
                 }
-                // Hover feedback: only redraw when the target actually changes.
-                let hit = self.hit_at_cursor();
-                if sidebar_changed {
-                    if let Some(w) = self.window.as_ref() {
-                        w.request_redraw();
-                    }
-                }
-                if hit != self.hover {
-                    self.hover = hit;
-                    self.update_cursor_icon();
+                if changed {
                     if let Some(w) = self.window.as_ref() {
                         w.request_redraw();
                     }
                 }
             }
             WindowEvent::CursorLeft { .. } => {
-                if self.hover.is_some() {
-                    self.hover = None;
-                    if let Some(w) = self.window.as_ref() {
-                        w.request_redraw();
-                    }
+                // The pointer left the window: no row is hovered any more.
+                self.cursor_pos = None;
+                self.hover = None;
+                self.sidebar.hover_tree = None;
+                self.sidebar.hover_open = None;
+                self.sidebar.hover_icon = None;
+                if let Some(w) = self.window.as_ref() {
+                    w.request_redraw();
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -1342,10 +1518,23 @@ impl ApplicationHandler for App {
                     return; // the page fits; nothing to scroll
                 }
                 // Over the file tree the wheel scrolls the tree, not the text.
-                if matches!(
-                    self.sidebar_hit(),
-                    Some(sidebar::Hit::TreeRow(_)) | Some(sidebar::Hit::Header)
-                ) {
+                // The hit map answers without any geometry of its own, and the
+                // tree band counts even between rows.
+                let over_tree = self.cursor_pos.is_some_and(|pos| {
+                    let scale = self
+                        .window
+                        .as_ref()
+                        .map(|w| w.scale_factor() as f32)
+                        .unwrap_or(1.0);
+                    let (x, y) = window::to_points(pos, scale);
+                    match self.sidebar_geometry() {
+                        Some((_, geo)) => {
+                            x < geo.sidebar_w && y >= geo.tree_y && y < geo.tree_y + geo.tree_h
+                        }
+                        None => false,
+                    }
+                });
+                if over_tree {
                     let dy = match delta {
                         MouseScrollDelta::LineDelta(_, y) => y * theme::ROW_H,
                         MouseScrollDelta::PixelDelta(p) => p.y as f32,
@@ -1358,9 +1547,9 @@ impl ApplicationHandler for App {
                             .unwrap_or(0);
                         let max = sidebar::max_scroll(geo.tree_h, rows);
                         self.sidebar.scroll = (self.sidebar.scroll - dy).clamp(0.0, max);
-                        if let Some(w) = self.window.as_ref() {
-                            w.request_redraw();
-                        }
+                        // Rows moved under a still pointer: re-resolve the
+                        // hover and the cursor, as section 3b requires.
+                        self.layout_changed();
                         return;
                     }
                 }

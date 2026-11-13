@@ -5,10 +5,11 @@
 use crate::editor::Editor;
 use crate::render::{Icon, Renderer};
 use crate::ui::focus::Focus;
+use crate::ui::hitmap::Target;
 use crate::ui::layout::Layout;
 use crate::ui::sidebar::{self, SidebarState};
 use crate::ui::theme::Palette;
-use crate::window::{Hit, WindowButton};
+use crate::window::WindowButton;
 use crate::workspace::Workspace;
 
 const GUTTER_PAD: f32 = 8.0;
@@ -20,8 +21,9 @@ pub struct Chrome<'a> {
     pub title: &'a str,
     pub modified: bool,
     pub maximized: bool,
-    /// The item under the mouse, for hover feedback.
-    pub hover: Option<Hit>,
+    /// The item under the mouse, for hover feedback. Same `Target` the hit map
+    /// and the cursor use, so the pill and the pointer can never disagree.
+    pub hover: Option<Target>,
     pub focus: Focus,
     pub sidebar: SidebarState,
     /// Colours for the active theme.
@@ -72,7 +74,7 @@ fn draw_title_bar(r: &mut Renderer, l: &Layout, chrome: &Chrome) {
     r.rect(0.0, h - 1.0, l.width, 1.0, p.border);
 
     // Sidebar toggle: the panel icon, on a subtle hover pill.
-    let toggle_hover = matches!(chrome.hover, Some(Hit::SidebarToggle));
+    let toggle_hover = matches!(chrome.hover, Some(Target::SidebarToggle));
     if toggle_hover {
         r.rounded_rect(4.0, 4.0, 22.0, h - 8.0, 4.0, p.pill_hover);
     }
@@ -89,7 +91,7 @@ fn draw_title_bar(r: &mut Renderer, l: &Layout, chrome: &Chrome) {
 
     // Window buttons: right as minimize/maximize/close, or left as
     // close/minimize/maximize next to the sidebar toggle. The order matches
-    // `window::hit_test` so clicks land on what is drawn.
+    // `window::chrome_regions`' order so clicks land on what is drawn.
     let bw = crate::window::BUTTON_W;
     let order: [WindowButton; 3] = if chrome.buttons_left {
         [
@@ -111,7 +113,7 @@ fn draw_title_bar(r: &mut Renderer, l: &Layout, chrome: &Chrome) {
     };
     for (i, button) in order.into_iter().enumerate() {
         let x = start + i as f32 * bw;
-        let hovered = chrome.hover == Some(Hit::Button(button));
+        let hovered = chrome.hover == Some(Target::Button(button));
         if hovered {
             let color = if button == WindowButton::Close {
                 p.close_hover

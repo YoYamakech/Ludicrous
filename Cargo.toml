@@ -1,6 +1,6 @@
 [package]
 name = "ludicrous"
-version = "0.1.0"
+version = "1.2.0"
 edition = "2021"
 description = "A minimal, fast C++ code editor with its own OpenGL renderer"
 
@@ -13,9 +13,31 @@ ropey = "1.6.1"
 fontdue = "0.9.5"
 arboard = { version = "3.6.1", default-features = false }
 
+# Heavy, optional features. All on by default, so a plain `cargo build` is the
+# full editor; turn them off for a fast edit/compile loop on the old laptop:
+#   cargo build --no-default-features
+#   cargo build --no-default-features --features syntax
+# Each phase must build with its feature on *and* off.
+#
+# The dependency lists fill in as the phases land; an empty list still gives a
+# real switch that the code can test with `cfg!(feature = "...")`.
+[features]
+default = ["syntax", "lsp", "updater", "dialogs"]
+syntax = []
+lsp = []
+updater = []
+dialogs = []
+
+# Release: small and fast. A debug build is only for working on the code.
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# Debug builds still need to feel responsive on the target laptop (spinning
+# HDD, weak CPU). opt-level = 1 costs nothing to build and makes the renderer
+# usable; lto/codegen-units stay release-only.
+[profile.dev]
+opt-level = 1

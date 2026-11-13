@@ -7,6 +7,8 @@
 
 use winit::dpi::PhysicalPosition;
 
+use crate::ui::hitmap::{HitMap, Rect, Target};
+
 /// Height of the title bar in points.
 pub const TITLE_H: f32 = 30.0;
 /// How far inside the window edge a resize drag starts, in points.
@@ -35,18 +37,6 @@ pub enum ResizeDirection {
     SouthWest,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Hit {
-    /// The text area: clicks go to the editor.
-    Content,
-    /// Empty title bar: drag the window, double-click to maximize.
-    TitleDrag,
-    /// The sidebar toggle button.
-    SidebarToggle,
-    Button(WindowButton),
-    Resize(ResizeDirection),
-}
-
 /// What the hit test needs to know about the window's current state.
 #[derive(Clone, Copy)]
 pub struct HitState {
@@ -56,74 +46,90 @@ pub struct HitState {
     pub buttons_left: bool,
 }
 
-/// Decide what is under `pos` (in points, top-left origin).
+/// Push the title bar and the resize edges into the hit map, back to front.
 ///
-/// Order matters: resize edges win over everything, because they are the
-/// outermost few pixels; then the title bar's buttons; then the drag region.
-pub fn hit_test(pos: (f32, f32), size: (f32, f32), state: HitState) -> Hit {
-    let (x, y) = pos;
-    let (w, h) = size;
+/// Order matters: the edges are pushed last because they are the front-most few
+/// pixels, then the title bar's buttons, then the drag region. `size` is in
+/// points.
+pub fn chrome_regions(out: &mut HitMap, size: (f32, f32), state: HitState) {
+    let (w, _h) = size;
 
-    // Maximized and fullscreen windows have no draggable edges.
+    // Title bar: exactly one region per drawn thing, in the same order as
+    // `ui/view.rs` draws them.
+    out.push(Rect::new(0.0, 0.0, w, TITLE_H), Target::TitleDrag);
+    out.push(
+        Rect::new(0.0, 0.0, TOGGLE_W, TITLE_H),
+        Target::SidebarToggle,
+    );
+    let buttons_w = BUTTON_W * 3.0;
+    let start = if state.buttons_left {
+        TOGGLE_W
+    } else {
+        w - buttons_w
+    };
+    let order = if state.buttons_left {
+        [
+            WindowButton::Close,
+            WindowButton::Minimize,
+            WindowButton::Maximize,
+        ]
+    } else {
+        [
+            WindowButton::Minimize,
+            WindowButton::Maximize,
+            WindowButton::Close,
+        ]
+    };
+    for (i, button) in order.into_iter().enumerate() {
+        // Skip a button that would hang off the window on a very narrow width.
+        if start + i as f32 * BUTTON_W >= w {
+            break;
+        }
+        out.push(
+            Rect::new(start + i as f32 * BUTTON_W, 0.0, BUTTON_W, TITLE_H),
+            Target::Button(button),
+        );
+    }
+
+    // Resize edges last: they win over everything, and they do not exist on a
+    // maximized or fullscreen window.
     if !state.maximized && !state.fullscreen {
-        if let Some(dir) = resize_direction(x, y, w, h) {
-            return Hit::Resize(dir);
+        let e = RESIZE_EDGE;
+        let dirs = [
+            (Rect::new(0.0, 0.0, e, e), ResizeDirection::NorthWest),
+            (Rect::new(w - e, 0.0, e, e), ResizeDirection::NorthEast),
+            (Rect::new(0.0, size.1 - e, e, e), ResizeDirection::SouthWest),
+            (
+                Rect::new(w - e, size.1 - e, e, e),
+                ResizeDirection::SouthEast,
+            ),
+            (
+                Rect::new(0.0, e, e, size.1 - 2.0 * e),
+                ResizeDirection::West,
+            ),
+            (
+                Rect::new(w - e, e, e, size.1 - 2.0 * e),
+                ResizeDirection::East,
+            ),
+            (Rect::new(e, 0.0, w - 2.0 * e, e), ResizeDirection::North),
+            (
+                Rect::new(e, size.1 - e, w - 2.0 * e, e),
+                ResizeDirection::South,
+            ),
+        ];
+        for (rect, dir) in dirs {
+            out.push(rect, Target::Resize(dir));
         }
     }
-
-    if y < TITLE_H {
-        // Sidebar toggle sits at the far left, before the title text.
-        if x < TOGGLE_W {
-            return Hit::SidebarToggle;
-        }
-        // Three buttons, laid out from the chosen side.
-        let buttons_w = BUTTON_W * 3.0;
-        let start = if state.buttons_left {
-            TOGGLE_W
-        } else {
-            w - buttons_w
-        };
-        if x >= start && x < start + buttons_w {
-            let index = ((x - start) / BUTTON_W).floor() as usize;
-            let button = if state.buttons_left {
-                // Traffic-light order: close, minimize, maximize.
-                [
-                    WindowButton::Close,
-                    WindowButton::Minimize,
-                    WindowButton::Maximize,
-                ][index.min(2)]
-            } else {
-                [
-                    WindowButton::Minimize,
-                    WindowButton::Maximize,
-                    WindowButton::Close,
-                ][index.min(2)]
-            };
-            return Hit::Button(button);
-        }
-        return Hit::TitleDrag;
-    }
-
-    Hit::Content
 }
 
-/// Which edge or corner `(x, y)` is on, if any.
-fn resize_direction(x: f32, y: f32, w: f32, h: f32) -> Option<ResizeDirection> {
-    let left = x < RESIZE_EDGE;
-    let right = x > w - RESIZE_EDGE;
-    let top = y < RESIZE_EDGE;
-    let bottom = y > h - RESIZE_EDGE;
-    match (left, right, top, bottom) {
-        (true, _, true, _) => Some(ResizeDirection::NorthWest),
-        (_, true, true, _) => Some(ResizeDirection::NorthEast),
-        (true, _, _, true) => Some(ResizeDirection::SouthWest),
-        (_, true, _, true) => Some(ResizeDirection::SouthEast),
-        (true, _, _, _) => Some(ResizeDirection::West),
-        (_, true, _, _) => Some(ResizeDirection::East),
-        (_, _, true, _) => Some(ResizeDirection::North),
-        (_, _, _, true) => Some(ResizeDirection::South),
-        _ => None,
-    }
+/// Single-point convenience used by the tests (and by nothing else: the app
+/// reads the map it already built).
+#[cfg(test)]
+pub fn hit_test(pos: (f32, f32), size: (f32, f32), state: HitState) -> Option<Target> {
+    let mut m = HitMap::new();
+    chrome_regions(&mut m, size, state);
+    m.target_at(pos)
 }
 
 /// Convert a physical cursor position to points, which is what the layout and
@@ -147,13 +153,26 @@ mod tests {
     }
 
     #[test]
-    fn middle_of_the_window_is_content() {
-        assert_eq!(hit_test((500.0, 300.0), SIZE, state()), Hit::Content);
+    fn the_middle_of_the_window_has_no_chrome() {
+        // The text area itself is registered by the app, not by the chrome.
+        assert_eq!(hit_test((500.0, 300.0), SIZE, state()), None);
+    }
+
+    #[test]
+    fn a_click_on_the_content_band_is_inert_chrome() {
+        // Nothing here is a resize edge or a title bar, so the earlier map (the
+        // text area, the sidebar) decides. Chrome itself adds no region.
+        let mut m = HitMap::new();
+        chrome_regions(&mut m, SIZE, state());
+        assert_eq!(m.target_at((500.0, 300.0)), None);
     }
 
     #[test]
     fn empty_title_bar_drags() {
-        assert_eq!(hit_test((400.0, 15.0), SIZE, state()), Hit::TitleDrag);
+        assert_eq!(
+            hit_test((400.0, 15.0), SIZE, state()),
+            Some(Target::TitleDrag)
+        );
     }
 
     #[test]
@@ -161,11 +180,11 @@ mod tests {
         // Close is the last of the three buttons.
         assert_eq!(
             hit_test((1000.0 - 20.0, 15.0), SIZE, state()),
-            Hit::Button(WindowButton::Close)
+            Some(Target::Button(WindowButton::Close))
         );
         assert_eq!(
             hit_test((1000.0 - 46.0 * 2.5, 15.0), SIZE, state()),
-            Hit::Button(WindowButton::Minimize)
+            Some(Target::Button(WindowButton::Minimize))
         );
     }
 
@@ -177,13 +196,16 @@ mod tests {
         };
         assert_eq!(
             hit_test((TOGGLE_W + 10.0, 15.0), SIZE, s),
-            Hit::Button(WindowButton::Close)
+            Some(Target::Button(WindowButton::Close))
         );
     }
 
     #[test]
     fn sidebar_toggle_is_at_the_top_left() {
-        assert_eq!(hit_test((10.0, 15.0), SIZE, state()), Hit::SidebarToggle);
+        assert_eq!(
+            hit_test((10.0, 15.0), SIZE, state()),
+            Some(Target::SidebarToggle)
+        );
     }
 
     #[test]
@@ -199,7 +221,11 @@ mod tests {
             ((998.0, 658.0), ResizeDirection::SouthEast),
         ];
         for (pos, want) in cases {
-            assert_eq!(hit_test(pos, SIZE, state()), Hit::Resize(want), "{pos:?}");
+            assert_eq!(
+                hit_test(pos, SIZE, state()),
+                Some(Target::Resize(want)),
+                "{pos:?}"
+            );
         }
     }
 
@@ -209,7 +235,8 @@ mod tests {
             maximized: true,
             ..state()
         };
-        assert_eq!(hit_test((200.0, 2.0), SIZE, s), Hit::TitleDrag);
-        assert_eq!(hit_test((2.0, 300.0), SIZE, s), Hit::Content);
+        assert_eq!(hit_test((200.0, 2.0), SIZE, s), Some(Target::TitleDrag));
+        // With no edges left, the app's own regions decide; chrome adds nothing.
+        assert_eq!(hit_test((2.0, 300.0), SIZE, s), None);
     }
 }

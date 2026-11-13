@@ -10,6 +10,7 @@
 
 use crate::config::{Buttons, Config, SidebarMode, Theme};
 use crate::render::Renderer;
+use crate::ui::hitmap::{HitMap, Rect, Target};
 use crate::ui::layout::Layout;
 use crate::ui::theme::Palette;
 use crate::ui::widgets::{self, Widget, CONTROL_W};
@@ -94,8 +95,9 @@ impl Geometry {
         self.y + PAGE_H + row as f32 * widgets::ROW_H
     }
 
-    /// Which row (and which part of its control) is under `(x, y)`.
-    pub fn hit(&self, x: f32, y: f32) -> Option<(usize, Option<usize>)> {
+    /// Which row is under `(x, y)`? The *part* of the control comes from the
+    /// hit map instead, so clicks and the cursor agree.
+    pub fn row_at(&self, x: f32, y: f32) -> Option<usize> {
         if x < self.x || x > self.x + self.w {
             return None;
         }
@@ -104,31 +106,8 @@ impl Geometry {
             return None;
         }
         let row = ((y - first) / widgets::ROW_H).floor() as usize;
-        if row >= Row::COUNT {
-            return None;
-        }
-        // The part is resolved by the caller, which knows the widget.
-        Some((row, Some(row_x_part(self, x))))
+        (row < Row::COUNT).then_some(row)
     }
-}
-
-/// X offset inside the control area, resolved later against the widget.
-fn row_x_part(geo: &Geometry, x: f32) -> usize {
-    let control_x = geo.x + geo.w - CONTROL_W;
-    if x < control_x {
-        return usize::MAX; // the label: selects the row, changes nothing
-    }
-    (x - control_x).floor() as usize
-}
-
-/// The x-only part number the click handler uses, straight from `widgets` so
-/// the drawn control and the hit region cannot drift apart.
-fn part_of(geo: &Geometry, row: Row, cfg: &Config, x: f32) -> Option<usize> {
-    let widget = widget_for(row, cfg);
-    let geom = widgets::RowGeom {
-        control_x: geo.x + geo.w - CONTROL_W,
-    };
-    geom.part(x, &widget)
 }
 
 /// Draw the page. Returns the row geometry for hit testing (same maths).
@@ -174,6 +153,42 @@ pub fn draw(
         }
     }
     geo
+}
+
+/// Register the settings page's regions. The whole panel is inert (the arrow),
+/// every control piece is clickable (the hand), and the labels stay inert: the
+/// cursor follows what a click would actually do.
+///
+/// The pieces come from `RowGeom::spans`, the same source `RowGeom::part` uses,
+/// so the map and a point lookup can never disagree.
+pub fn register(map: &mut HitMap, l: &Layout, cfg: &Config) {
+    let geo = Geometry::new(l);
+    // Panel background: drawn over the text area, so it swallows clicks there.
+    map.push(
+        Rect::new(
+            geo.x,
+            geo.y,
+            geo.w,
+            PAGE_H + Row::COUNT as f32 * widgets::ROW_H,
+        ),
+        Target::None,
+    );
+    let control_x = geo.x + geo.w - CONTROL_W;
+    let geom = widgets::RowGeom { control_x };
+    for i in 0..Row::COUNT {
+        let row = Row::from_index(i);
+        let widget = widget_for(row, cfg);
+        let y = geo.row_y(i);
+        for (x, w, part) in geom.spans(&widget) {
+            map.push(
+                Rect::new(x, y, w, widgets::ROW_H),
+                Target::SettingsRow {
+                    row: i,
+                    part: Some(part),
+                },
+            );
+        }
+    }
 }
 
 /// The control a row shows, built from the config so drawing and changing
@@ -332,18 +347,14 @@ pub fn choose(cfg: &mut Config, row: Row, index: usize) -> bool {
     *cfg != before
 }
 
-/// Apply a click at `(x, y)`. Returns the row when the click landed on the
-/// page (so the caller can move the selection there), and whether the config
-/// changed. The caller saves and rebuilds what it must.
-pub fn click(cfg: &mut Config, l: &Layout, x: f32, y: f32) -> Option<(usize, bool)> {
-    let geo = Geometry::new(l);
-    let (index, _) = geo.hit(x, y)?;
-    let row = Row::from_index(index);
-    let Some(part) = part_of(&geo, row, cfg, x) else {
-        // Label click: select the row, change nothing.
-        return Some((index, false));
+/// Change the config for one control piece, the same way a click does.
+/// `part` is what `RowGeom::part` returned; `None` means the label, which only
+/// selects the row.
+pub fn apply_part(cfg: &mut Config, row: Row, part: Option<usize>) -> bool {
+    let Some(part) = part else {
+        return false;
     };
-    let changed = match widget_for(row, cfg) {
+    match widget_for(row, cfg) {
         Widget::Toggle(_) => step(cfg, row, 1),
         Widget::Stepper(_) => match part {
             0 => step(cfg, row, -1),
@@ -351,8 +362,7 @@ pub fn click(cfg: &mut Config, l: &Layout, x: f32, y: f32) -> Option<(usize, boo
             _ => false, // the value box in the middle does nothing
         },
         Widget::Choice { .. } => choose(cfg, row, part),
-    };
-    Some((index, changed))
+    }
 }
 
 #[cfg(test)]

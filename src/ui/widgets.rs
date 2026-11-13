@@ -39,34 +39,41 @@ pub struct RowGeom {
 }
 
 impl RowGeom {
-    /// Which part of the control is at `x`? `None` when left of the control.
-    /// For a choice row the result is the segment index; for a stepper it is
-    /// 0 (minus), 1 (value), 2 (plus); for a toggle 0.
-    pub fn part(&self, x: f32, widget: &Widget) -> Option<usize> {
-        if x < self.control_x {
-            return None;
-        }
-        let dx = x - self.control_x;
+    /// The clickable pieces of a control, as `(x, width, part)` in row
+    /// coordinates. This is the single source of hit geometry: `part()` answers
+    /// a point, `settings::register` builds the hit map, and both read this.
+    ///
+    /// The value box in the middle of a stepper is deliberately absent: it does
+    /// nothing, so it must not show a hand cursor.
+    pub fn spans(&self, widget: &Widget) -> Vec<(f32, f32, usize)> {
         match widget {
-            Widget::Toggle(_) => Some(0),
+            Widget::Toggle(_) => vec![(self.control_x, CONTROL_W, 0)],
             Widget::Stepper(_) => {
                 // The stepper box is right-aligned in the control column.
-                let dx = x - (self.control_x + CONTROL_W - STEP_W);
-                if dx < 0.0 {
-                    None
-                } else if dx < STEP_BTN {
-                    Some(0)
-                } else if dx >= STEP_W - STEP_BTN {
-                    Some(2)
-                } else {
-                    Some(1)
-                }
+                let x = self.control_x + CONTROL_W - STEP_W;
+                vec![(x, STEP_BTN, 0), (x + STEP_W - STEP_BTN, STEP_BTN, 2)]
             }
             Widget::Choice { options, .. } => {
-                let seg = (CONTROL_W / options.len().max(1) as f32).max(1.0);
-                Some(((dx / seg).floor() as usize).min(options.len().saturating_sub(1)))
+                let n = options.len().max(1);
+                let seg = CONTROL_W / n as f32;
+                (0..n)
+                    .map(|k| (self.control_x + k as f32 * seg, seg, k))
+                    .collect()
             }
         }
+    }
+
+    /// Which part of the control is at `x`? `None` when left of the control or
+    /// Used by the tests to prove `spans` covers exactly what a point can hit.
+    /// between the pieces of a stepper.
+    /// For a choice row the result is the segment index; for a stepper it is
+    /// 0 (minus) or 2 (plus); for a toggle 0.
+    #[cfg(test)] // the app reads `spans`; this is the same maths, for tests
+    pub fn part(&self, x: f32, widget: &Widget) -> Option<usize> {
+        self.spans(widget)
+            .into_iter()
+            .find(|(sx, sw, _)| x >= *sx && x < *sx + *sw)
+            .map(|(_, _, part)| part)
     }
 }
 
@@ -161,12 +168,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stepper_parts_are_minus_value_plus() {
+    fn stepper_parts_are_minus_and_plus() {
         let g = RowGeom { control_x: 100.0 };
         let w = Widget::Stepper("15");
         let x0 = 100.0 + CONTROL_W - STEP_W; // stepper box left edge
         assert_eq!(g.part(x0 + 5.0, &w), Some(0), "minus");
-        assert_eq!(g.part(x0 + STEP_W * 0.5, &w), Some(1), "value");
+        // The value box does nothing, so it is not a clickable part and shows
+        // the arrow rather than the hand (v1.2 section 3b: inert is Default).
+        assert_eq!(g.part(x0 + STEP_W * 0.5, &w), None, "value box");
         assert_eq!(g.part(x0 + STEP_W - 5.0, &w), Some(2), "plus");
         assert_eq!(g.part(50.0, &w), None, "left of the control is the label");
     }
@@ -181,5 +190,42 @@ mod tests {
         assert_eq!(g.part(10.0, &w), Some(0));
         assert_eq!(g.part(CONTROL_W * 0.5, &w), Some(1));
         assert_eq!(g.part(CONTROL_W - 1.0, &w), Some(2));
+    }
+
+    #[test]
+    fn spans_and_part_agree_for_every_control_type() {
+        let g = RowGeom { control_x: 0.0 };
+        let widgets = [
+            Widget::Toggle(true),
+            Widget::Stepper("15"),
+            Widget::Choice {
+                options: &["2", "4", "8"],
+                index: 1,
+            },
+        ];
+        for w in widgets {
+            let spans = g.spans(&w);
+            // Every part reachable by `part()` is inside exactly one span.
+            let mut x = 0.0;
+            while x < CONTROL_W {
+                if let Some(part) = g.part(x, &w) {
+                    let hits: Vec<_> = spans
+                        .iter()
+                        .filter(|(sx, sw, _)| x >= *sx && x < *sx + *sw)
+                        .collect();
+                    assert_eq!(hits.len(), 1, "x={x} part={part} spans={spans:?}");
+                    assert_eq!(hits[0].2, part);
+                }
+                x += 0.5;
+            }
+        }
+    }
+
+    #[test]
+    fn the_stepper_value_box_is_not_clickable() {
+        let g = RowGeom { control_x: 0.0 };
+        let w = Widget::Stepper("15");
+        let box_x = CONTROL_W - STEP_W + STEP_BTN + 1.0;
+        assert_eq!(g.part(box_x, &w), None);
     }
 }
