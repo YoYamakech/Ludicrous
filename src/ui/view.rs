@@ -576,14 +576,63 @@ fn draw_runs(
             continue;
         }
         if kind != run_kind {
-            let text: String = chars[run_start..i].iter().collect();
-            r.text(l.text_x, y, &text, p.syntax(run_kind));
+            emit_run(r, line, base, run_start, i, l, y, p.syntax(run_kind));
             run_start = i;
             run_kind = kind;
         }
     }
-    let text: String = chars[run_start..].iter().collect();
-    r.text(l.text_x, y, &text, p.syntax(run_kind));
+    emit_run(
+        r,
+        line,
+        base,
+        run_start,
+        chars.len(),
+        l,
+        y,
+        p.syntax(run_kind),
+    );
+}
+
+/// Draw one same-colour run of a line, at the x where its first character
+/// belongs.
+///
+/// Runs used to be queued at `l.text_x` regardless of where they started,
+/// which put every run back at the left margin: with highlighting on, indented
+/// code was drawn as overlapping text from column 0 (issue #7). The start x is
+/// measured on the *full* line so tab stops and the horizontal scroll agree
+/// with what the caret and the guides compute.
+#[allow(clippy::too_many_arguments)] // geometry, line, span and palette
+fn emit_run(
+    r: &mut Renderer,
+    line: &str,
+    base: u32,
+    from: usize,
+    to: usize,
+    l: &Layout,
+    y: f32,
+    color: crate::render::Color,
+) {
+    if to <= from {
+        return;
+    }
+    let (text, col) = run_slice(line, base as usize, from, to);
+    let scroll_px = r.text_pen_x(l.text_x, line, base as usize) - l.text_x;
+    let x = r.text_pen_x(l.text_x, line, col) - scroll_px;
+    r.text(x, y, &text, color);
+}
+
+/// The text of one run and the column of the line it starts at.
+///
+/// Separate from `emit_run` so the column arithmetic can be tested without a
+/// GL context: a run starting at index 8 must report column 8, not 0. That is
+/// the bug in issue #7, where every run was drawn at the left margin.
+fn run_slice(line: &str, base: usize, from: usize, to: usize) -> (String, usize) {
+    let text: String = line
+        .chars()
+        .skip(base + from)
+        .take(to.saturating_sub(from))
+        .collect();
+    (text, base + from)
 }
 
 /// Squiggle and gutter colour for a severity. Info and hints share the calm
@@ -628,4 +677,35 @@ fn format_usize(mut n: usize, buf: &mut [u8; 20]) -> &str {
     }
     // Every byte written is an ASCII digit.
     std::str::from_utf8(&buf[i..]).unwrap_or("?")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_run_reports_the_column_it_starts_at() {
+        let line = "        let x = 1;";
+        // Indented code with a keyword span over `let`: the run must start at
+        // column 8, not at 0 (issue #7).
+        let (text, col) = run_slice(line, 0, 8, 11);
+        assert_eq!(text, "let");
+        assert_eq!(col, 8);
+    }
+
+    #[test]
+    fn a_run_after_a_horizontal_scroll_keeps_its_place() {
+        let line = "1234567890abcdef";
+        // Scrolled 10 columns, run covering the visible span 2..6.
+        let (text, col) = run_slice(line, 10, 2, 6);
+        assert_eq!(text, "cdef");
+        assert_eq!(col, 12);
+    }
+
+    #[test]
+    fn a_run_past_the_end_of_the_line_is_empty() {
+        let (text, col) = run_slice("abc", 0, 5, 9);
+        assert!(text.is_empty());
+        assert_eq!(col, 5);
+    }
 }
