@@ -15,6 +15,11 @@ use crate::workspace::Workspace;
 
 const GUTTER_PAD: f32 = 8.0;
 const CURSOR_W: f32 = 2.0;
+/// How far left of the caret's own column the active indent guide is drawn.
+/// The caret sits exactly on that column, and a 1 px guide under a 2 px caret
+/// is invisible: pressing Tab used to bury the guide you just moved to. Six
+/// pixels read as "behind the cursor" without looking detached (issue #7).
+const GUIDE_CARET_GAP: f32 = 6.0;
 
 /// Everything the chrome needs that is not editor state.
 pub struct Chrome<'a> {
@@ -347,7 +352,16 @@ fn draw_editor(r: &mut Renderer, ed: &Editor, l: &Layout, p: &Palette, chrome: &
                     } else {
                         p.indent_guide
                     };
-                    r.rect(x, y + 1.0, 1.0, l.cell_h - 2.0, color);
+                    // The caret is `CURSOR_W` wide and sits on the same x as
+                    // the guide of the level it is in. Nudge the caret's own
+                    // guide back so both stay visible, but never out of the
+                    // text area.
+                    let gx = if active {
+                        (x - GUIDE_CARET_GAP).max(l.text_x)
+                    } else {
+                        x
+                    };
+                    r.rect(gx, y + 1.0, 1.0, l.cell_h - 2.0, color);
                 }
             }
         }
